@@ -1,0 +1,170 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# EXAMPLE overlay. Copy this directory and edit it for your cluster.
+# Phase 00-platform namespaces belong to the product or the cluster, so this overlay sets none.
+
+resources:
+  - ../../../base/00-platform
+
+# ---------------------------------------------------------------------------------------------
+# Read these two hazards before you apply this phase. Both replace an object your cluster may
+# already own, and both do it without asking:
+#   base/00-platform/cluster-monitoring-config.yaml         Replaces the whole ConfigMap. This
+#                                                            also discards existing Prometheus
+#                                                            emptyDir history.
+#   base/00-platform/alertmanager-placeholder-receiver.yaml Replaces the whole Secret. This
+#                                                            discards your entire Alertmanager
+#                                                            config.
+# If either object already exists on your cluster, merge the keys by hand instead. Each file
+# gives the exact commands. Do not apply first and check later.
+#
+# Alerts go nowhere until you choose a destination. The shipped receiver only stops the
+# AlertmanagerReceiversNotConfigured alert from firing. It does not affect whether rules
+# evaluate — that depends on Prometheus, Thanos Ruler, and user-workload monitoring being on.
+# You must wire a receiver that delivers alerts, and a matcher that reaches it. This tree does
+# not guess that for you.
+#
+# ---------------------------------------------------------------------------------------------
+# The FlashBlade exporter needs two things from you. It collects nothing until it has both.
+#
+# 1. Your array's management address.
+#    base/00-platform/servicemonitor-flashblade-exporter.yaml ships four scrape jobs. All four
+#    point at `flashblade.example.com`, which does not exist. If you apply this unedited, all
+#    four targets go down with a name-resolution error. Uncomment and edit:
+#
+#      patches:
+#        - target:
+#            group: monitoring.coreos.com
+#            version: v1
+#            kind: ServiceMonitor
+#            name: flashblade-exporter
+#          patch: |-
+#            - op: replace
+#              path: "/spec/endpoints/0/params/endpoint"
+#              value: ["fb-mgmt.your-domain.example"]
+#            - op: replace
+#              path: "/spec/endpoints/1/params/endpoint"
+#              value: ["fb-mgmt.your-domain.example"]
+#            - op: replace
+#              path: "/spec/endpoints/2/params/endpoint"
+#              value: ["fb-mgmt.your-domain.example"]
+#            - op: replace
+#              path: "/spec/endpoints/3/params/endpoint"
+#              value: ["fb-mgmt.your-domain.example"]
+#
+#    Use this JSON6902 patch, with one `op` per job. Do not use a strategic merge patch:
+#    `spec.endpoints` is a list inside a CRD, and Kustomize has no merge schema for it. A merge
+#    patch replaces the whole list, so you would then need to maintain a second copy of all four
+#    jobs in this file. Use the array's management address (the REST endpoint), not a data VIP.
+#
+# 2. A readonly array API token, as a Secret. This tree does not contain one:
+#
+#      oc create secret generic flashblade-exporter-token -n flashblade-exporter \
+#        --from-literal=token='<token of a `readonly` array admin>'
+#
+#    Use a `readonly` token, not an `array_admin` token. Prometheus sends this token on every
+#    scrape. Anyone who can read Secrets in that namespace can read it too. A readonly token
+#    limits the damage; an admin token would leak control of the array.
+#
+# Make this patch here, in this file. Do not apply it ad hoc. If you edit the live ServiceMonitor
+# directly with `oc edit` or `oc patch`, Kustomize cannot see the fix. The next `apply -k` of this
+# phase reverts the endpoint back to `flashblade.example.com`, without warning. This file is the
+# source of truth. Re-applying it re-asserts exactly what it contains.
+#
+# ---------------------------------------------------------------------------------------------
+# OVERRIDING PROMETHEUS STORAGE AND RETENTION
+#
+# `data.config.yaml` is one string that contains an embedded YAML document. Kustomize's merge
+# logic cannot reach inside a string, so a patch must restate the whole document. You cannot
+# make a partial edit. Uncomment and adjust:
+#
+#   patches:
+#     - target:
+#         kind: ConfigMap
+#         name: cluster-monitoring-config
+#       patch: |-
+#         apiVersion: v1
+#         kind: ConfigMap
+#         metadata:
+#           name: cluster-monitoring-config
+#           namespace: openshift-monitoring
+#         data:
+#           config.yaml: |
+#             enableUserWorkload: true
+#             prometheusK8s:
+#               retention: 45d
+#               retentionSize: 180GiB
+#               volumeClaimTemplate:
+#                 spec:
+#                   accessModes:
+#                     - ReadWriteOnce
+#                   storageClassName: YOUR-RWO-BLOCK-CLASS
+#                   resources:
+#                     requests:
+#                       storage: 200Gi
+#
+# If you have block storage, override `storageClassName`. Do this. The base default is the
+# NFS-backed class this tree provisions. Prometheus's TSDB uses mmap, and upstream does not
+# support mmap on network filesystems. The default exists because it is the only retaining
+# class this tree creates, not because it is the correct choice.
+#
+# Set `retentionSize` below the requested storage size. Prometheus does not stop when the disk
+# fills. It wedges instead. `retention` bounds time, not bytes.
+#
+# The same rule applies to `user-workload-monitoring-config` in
+# openshift-user-workload-monitoring. Its keys are named `prometheus:`, not `prometheusK8s:`.
+# If you set retention only in the cluster ConfigMap, user-workload metrics stay on the
+# default retention. This looks configured, but it behaves like the default.
+#
+# ---------------------------------------------------------------------------------------------
+# OTHER THINGS YOU WILL PROBABLY NEED TO CHANGE
+#
+#   servicemonitor-kuberay-operator.yaml   RHOAI puts the operator in namespace
+#                                          `redhat-ods-applications`. Upstream Helm installs it
+#                                          in `ray-system`. A ServiceMonitor only scrapes its own
+#                                          namespace under user-workload monitoring, so move it
+#                                          with the operator.
+#   dcgm-exporter-counters.yaml            Does nothing until your GPU Operator ClusterPolicy
+#                                          sets `dcgmExporter.config.name` and the
+#                                          DCGM_EXPORTER_COLLECTORS env var. The file has the
+#                                          exact patch. Its counter list assumes L40S: no NVLink,
+#                                          no MIG. On A100 or H100, add the NVLink and MIG fields
+#                                          you need.
+
+# ---------------------------------------------------------------------------------------------
+# GPU QUOTA AND THE FLAVOUR — SIZE BOTH TO YOUR CLUSTER, TOGETHER.
+#
+# The base ships a ClusterQueue with nominal quota of 8 GPU, 56 CPU, 1600Gi, and 720Gi
+# ephemeral-storage. This is enough for one training run at this pipeline's default
+# configuration. It also ships a ResourceFlavor named `gpu` that selects
+# `nvidia.com/gpu.present: "true"`.
+#
+# If quota is below what a run needs, the run does not fail. It hangs. Kueue holds the workload
+# as unadmitted. There is no error on the RayJob and no event on the pod, because no pod has
+# been created yet. If a run appears to do nothing at all, check this first:
+#
+#   oc get clusterqueue ml-training-cq -o yaml | grep -A5 flavorsUsage
+#   oc get workloads -n <your-namespace>
+#
+# SCALE ephemeral-storage WITH nvidia.com/gpu, NOT INDEPENDENTLY. Every GPU-worker pod requests
+# 90Gi of ephemeral-storage alongside its one GPU, so doubling GPU quota without also doubling
+# ephemeral-storage reproduces the exact same silent hang this note just described — for the
+# additional workers only, which makes it look like a partial, mysterious failure instead of the
+# same quota-omission bug. The patch below scales both together for a 16-GPU floor (2x this
+# base's 8):
+#
+#   patches:
+#     - target: {group: kueue.x-k8s.io, version: v1beta1, kind: ClusterQueue, name: ml-training-cq}
+#       patch: |-
+#         - op: replace
+#           path: "/spec/resourceGroups/0/flavors/0/resources/2/nominalQuota"
+#           value: "16"
+#         - op: replace
+#           path: "/spec/resourceGroups/0/flavors/0/resources/3/nominalQuota"
+#           value: "1440Gi"
+#
+# If you narrow the flavour to one GPU model (see
+# base/00-platform/kueue-resourceflavor-gpu.yaml), narrow the workload pod specs in
+# overlays/example/40-workloads to match. Kueue adds the flavour's nodeLabels on admission. If
+# the two disagree, the intersection is empty, and pods never schedule.

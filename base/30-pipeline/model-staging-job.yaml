@@ -1,0 +1,160 @@
+# Stage the Qwen3-32B base model and the Nemotron dataset into FlashBlade S3, before any
+# training run.
+#
+# The training script (train_qwen3_deepspeed.py) downloads the model from
+# s3://my-models/base-models/qwen3-32b and the dataset from
+# s3://my-models/datasets/nemotron-agentic-v1/data/interactive_agent.jsonl at worker startup.
+# If these files are missing, every training run fails at download_model().
+#
+# This Job stages both from HuggingFace Hub. It runs on CPU only; it needs no GPU. Expected
+# duration is 60 to 120 minutes (Qwen3-32B is about 65 GB in safetensors format).
+#
+# PREREQUISITES:
+#   - a `flashblade-s3` secret in your application namespace (you create it — see
+#     docs/getting-started.md section 6)
+#   - the `my-models` bucket exists and is writable
+#   - HuggingFace Hub access: set `HF_TOKEN` in the `hf-token` secret (see below)
+#
+# APPLY:
+#   1. Create the HuggingFace token secret (one time):
+#      oc create secret generic hf-token -n ml-training \
+#        --from-literal=HF_TOKEN=<your-hf-token>
+#   2. Apply the staging job:
+#      oc -n ml-training apply -f model-staging-job.yaml
+#   3. Watch:
+#      oc -n ml-training logs -f job/model-staging
+#   4. When done, check the result:
+#      aws --endpoint-url $S3_ENDPOINT s3 ls s3://my-models/base-models/qwen3-32b/ | wc -l
+#      # Expect about 20 safetensor shards plus config files
+#
+# WARNING: the `-n` flag is required. If you omit it, the Job fails with no error message. This
+# manifest sets no `metadata.namespace`; the Kustomize overlay sets it. A bare `oc apply -f`
+# creates the Job in your current context's namespace, where the `hf-token` Secret and
+# `pipeline-config` ConfigMap it needs do not exist. The Job is created, but its pod cannot be
+# scheduled, because it references objects that do not exist there. See
+# base/40-workloads/rayjob-eval-v8.yaml for related detail. Use
+# `make apply-phase OVERLAY=overlays/<yours> PHASE=30-pipeline` instead. It cannot get this wrong.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-staging
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: stager
+          image: registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # Pinned so a customer applying this manifest months from now gets the same
+              # resolved packages this job was tested against, not whatever huggingface-hub/
+              # boto3 happen to resolve to on that day.
+              pip install --quiet huggingface-hub==0.25.2 boto3==1.35.36 2>&1 | tail -5
+
+              python3 - <<'PYEOF'
+              import os, boto3, pathlib, tempfile
+              from botocore.config import Config
+              from huggingface_hub import snapshot_download
+
+              HF_TOKEN   = os.environ["HF_TOKEN"]
+              S3_EP      = os.environ["S3_ENDPOINT"]
+              ACCESS_KEY = os.environ["AWS_ACCESS_KEY_ID"]
+              SECRET_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
+              BUCKET     = os.environ.get("S3_DATA_BUCKET", "my-models")
+              MODEL_ID   = os.environ.get("MODEL_ID", "Qwen/Qwen3-32B")
+              MODEL_PFX  = os.environ.get("MODEL_PREFIX", "base-models/qwen3-32b")
+              DATASET_ID = os.environ.get("DATASET_ID", "nvidia/Nemotron-Agentic-v1")
+              DATASET_PFX= os.environ.get("DATASET_PREFIX", "datasets/nemotron-agentic-v1")
+              DATASET_FILE = "data/interactive_agent.jsonl"
+
+              s3 = boto3.client(
+                  "s3", endpoint_url=S3_EP,
+                  aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY,
+                  # WARNING: TLS verification is off here. The storage array used for validation had
+                  # a self-signed certificate. Do not copy this setting. Use a CA bundle instead.
+                  config=Config(signature_version="s3v4"), verify=False,
+              )
+
+              def s3_exists(key):
+                  try: s3.head_object(Bucket=BUCKET, Key=key); return True
+                  except: return False
+
+              def upload_dir(local, prefix):
+                  for p in pathlib.Path(local).rglob("*"):
+                      if not p.is_file(): continue
+                      key = f"{prefix}/{p.relative_to(local)}"
+                      if s3_exists(key):
+                          print(f"  skip (exists): {key}", flush=True)
+                          continue
+                      print(f"  upload: {key}", flush=True)
+                      s3.upload_file(str(p), BUCKET, key)
+
+              # Stage model
+              marker = f"{MODEL_PFX}/.staging_complete"
+              if s3_exists(marker):
+                  print(f"Model already staged ({MODEL_PFX}), skipping.", flush=True)
+              else:
+                  print(f"Downloading {MODEL_ID} from HuggingFace...", flush=True)
+                  with tempfile.TemporaryDirectory() as td:
+                      local = snapshot_download(MODEL_ID, local_dir=td, token=HF_TOKEN)
+                      print(f"Upload to s3://{BUCKET}/{MODEL_PFX}/", flush=True)
+                      upload_dir(local, MODEL_PFX)
+                  s3.put_object(Bucket=BUCKET, Key=marker, Body=b"ok")
+                  print("Model staging complete.", flush=True)
+
+              # Stage dataset file
+              ds_key = f"{DATASET_PFX}/{DATASET_FILE}"
+              if s3_exists(ds_key):
+                  print(f"Dataset already staged ({ds_key}), skipping.", flush=True)
+              else:
+                  print(f"Downloading dataset {DATASET_ID}...", flush=True)
+                  with tempfile.TemporaryDirectory() as td:
+                      local = snapshot_download(
+                          DATASET_ID, local_dir=td, token=HF_TOKEN,
+                          repo_type="dataset", allow_patterns=[DATASET_FILE],
+                      )
+                      src = pathlib.Path(local) / DATASET_FILE
+                      if not src.exists():
+                          raise FileNotFoundError(f"{DATASET_FILE} not found in {local}")
+                      print(f"Upload to s3://{BUCKET}/{ds_key}", flush=True)
+                      s3.upload_file(str(src), BUCKET, ds_key)
+                  print("Dataset staging complete.", flush=True)
+
+              print("=== STAGING COMPLETE ===", flush=True)
+              PYEOF
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          env:
+            - name: HF_TOKEN
+              valueFrom: {secretKeyRef: {name: hf-token, key: HF_TOKEN}}
+            - name: S3_ENDPOINT
+              valueFrom: {secretKeyRef: {name: flashblade-s3, key: S3_ENDPOINT}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_ACCESS_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_SECRET_ACCESS_KEY}}
+            # Change MODEL_ID and DATASET_ID here if you use a different model or dataset.
+            - name: MODEL_ID
+              value: "Qwen/Qwen3-32B"
+            - name: DATASET_ID
+              value: "nvidia/Nemotron-Agentic-v1"
+          resources:
+            # This job downloads Qwen3-32B (about 65 GB in safetensors) via
+            # huggingface_hub.snapshot_download into a tempfile.TemporaryDirectory under /tmp
+            # (the container's writable layer, not a mounted volume) before uploading it to S3.
+            # ephemeral-storage below covers that plus headroom.
+            requests: {cpu: "2", memory: 8Gi, ephemeral-storage: 90Gi}
+            limits:   {cpu: "4", memory: 16Gi, ephemeral-storage: 100Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile: {type: RuntimeDefault}
+            capabilities: {drop: ["ALL"]}

@@ -1,0 +1,114 @@
+# This is the FBDA RWX smoke test. It proves the Portworx-to-FlashBlade NFS data path
+# works end to end: one PVC on px-flashblade-fbda, mounted ReadWriteMany into two pods
+# on two different nodes (chosen by anti-affinity, not by name). Each pod writes a
+# file. A shared-read check confirms both pods see the other pod's file over the same
+# FlashBlade NFS export.
+#
+# This file is deliberately excluded from base/10-storage/kustomization.yaml's resources list
+# (see the WARNING there), so `oc apply -k overlays/<env>/10-storage` does not apply it. Apply
+# it directly instead:
+#
+# Apply:  oc apply -f base/10-storage/fbda-rwx-test.yaml
+# Verify: oc -n fbda-test get pvc,pods -o wide
+#         oc -n fbda-test exec fbda-writer-a -- cat /data/from-b.txt
+#         oc -n fbda-test exec fbda-writer-b -- cat /data/from-a.txt
+# Clean:  oc delete ns fbda-test   (the StorageClass Delete policy reclaims the FlashBlade filesystem)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fbda-test
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fbda-rwx
+  namespace: fbda-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: px-flashblade-fbda
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fbda-writer-a
+  namespace: fbda-test
+  labels:
+    app: fbda-rwx-test
+spec:
+  # This selector places pods by label, not by node name. A customer's nodes do not
+  # share our node names.
+  #
+  # PREREQUISITE: Node Feature Discovery must supply the `nvidia.com/gpu.present`
+  # label. This repository does not ship Node Feature Discovery; it is a documented
+  # prerequisite (see ENVIRONMENT-CONTRACT.md section 2). Without it, both pods stay
+  # Pending and the smoke test never runs or reports a result. If you have no Node
+  # Feature Discovery, label the nodes by hand, or change this selector.
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: fbda-rwx-test
+          topologyKey: kubernetes.io/hostname
+  restartPolicy: Never
+  containers:
+    - name: writer
+      image: registry.access.redhat.com/ubi9/ubi-minimal@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          echo "hello from writer-a $(date -u)" > /data/from-a.txt
+          sync
+          echo "wrote /data/from-a.txt; sleeping"
+          sleep 3600
+      volumeMounts:
+        - name: shared
+          mountPath: /data
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: fbda-rwx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fbda-writer-b
+  namespace: fbda-test
+  labels:
+    app: fbda-rwx-test
+spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: fbda-rwx-test
+          topologyKey: kubernetes.io/hostname
+  restartPolicy: Never
+  containers:
+    - name: writer
+      image: registry.access.redhat.com/ubi9/ubi-minimal@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          echo "hello from writer-b $(date -u)" > /data/from-b.txt
+          sync
+          echo "wrote /data/from-b.txt; sleeping"
+          sleep 3600
+      volumeMounts:
+        - name: shared
+          mountPath: /data
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: fbda-rwx

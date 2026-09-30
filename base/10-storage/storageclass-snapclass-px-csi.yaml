@@ -1,0 +1,152 @@
+# PX-CSI checkpoint StorageClass (Retain) and on-demand VolumeSnapshotClass.
+# Apply it after storagecluster-px-csi.yaml reaches Running.
+#
+# This class is based on the working Enterprise FBDA StorageClass
+# (storageclass-pure-file.yaml). It uses the same provisioner, backend, export rules, and mount
+# options. The reclaimPolicy is changed to Retain. Retain is REQUIRED for the FBDA
+# snapshot and restore flow, and it protects checkpoint data on delete.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: px-fb-direct-access-nfsv4-retain
+provisioner: pxd.portworx.com
+parameters:
+  backend: "pure_file"
+  # no_root_squash IS LOAD-BEARING HERE. It looks like a permissive default that you should
+  # tighten. It is the reason a mount of this volume takes O(1) time, not O(files) time.
+  #
+  # Measured with three throwaway 1Gi volumes, 20,001 files each, sweeping export rules and
+  # fsGroupChangePolicy:
+  #
+  #   export rules                                       Always   OnRootMismatch   volume root after mount
+  #   *(rw,no_root_squash)                                 27 s      6 s / 7 s     2777 0:<fsGroup>  (stamped)
+  #   *(rw,root_squash)                                    27 s     24 s / 26 s     777 0:0          (NEVER stamped)
+  #   *(rw,root_squash,anonuid=<fsGroup>,anongid=<fsGroup>) 28 s     24 s / 27 s     777 0:0          (NEVER stamped)
+  #
+  # Under root_squash, the kubelet still checks every file. Each lchown and chmod call just
+  # returns EPERM. The cost is the same and nothing is gained. It is worse than no_root_squash:
+  # the volume root can never be stamped, so fsGroupChangePolicy: OnRootMismatch mismatches on
+  # EVERY mount and walks the whole volume every time. That combination is the only one that
+  # always costs O(files); it is worse than this setting.
+  #
+  # This also fails silently, in the direction that matters most. All three settings reached
+  # Running and wrote data correctly. The array's default root mode is 0777, but it has no setgid
+  # bit, so new files do not inherit the group. The pod looks healthy on a volume where ownership
+  # was never actually applied. The kubelet logs one Error line per file
+  # (volume_linux.go:75/101, "operation not permitted") and creates NO Kubernetes event, so
+  # `kubectl describe` shows nothing.
+  #
+  # Pinning the anon identity does not fix this, even though the idea sounds correct. anonuid
+  # and anongid do work for the pod's own writes. But the kubelet's uid 0 is remapped to anonuid,
+  # while files are owned by the container's uid, and POSIX requires matching ownership to
+  # change a file's group. Pre-setting ownership on the tree does not last, because the
+  # workload's next write is owned by the container's uid again.
+  #
+  # THE SECURITY TRADE-OFF, STATED PLAINLY: no_root_squash lets the node's root user act as true
+  # root across this whole export. That is more access than the workload needs. But on this
+  # driver, with an fsGroup that OpenShift sets whether you ask for it or not, root_squash is not
+  # a safer choice. It gives you a volume that walks itself on every mount and never gets the
+  # ownership it needs. If your platform does not set an fsGroup, reconsider this setting. Here,
+  # it is the correct choice.
+  pure_export_rules: "*(rw,no_root_squash)"
+  # HIDE THE ARRAY'S .snapshot DIRECTORY ON EVERY VOLUME THIS CLASS CREATES.
+  #
+  # FlashBlade shows read-only copies of a filesystem's snapshots at .snapshot inside the
+  # export. This is a browse feature, and it is a trap for Kubernetes. With a pod fsGroup set —
+  # which OpenShift sets whether you ask for it or not — the kubelet recursively runs lchown and
+  # chmod on the WHOLE volume on EVERY pod mount. This means it also walks a full read-only copy
+  # of the volume for every snapshot that exists, at two rejected NFS SETATTR calls per file.
+  # This chown walk is slow enough to evict RayClusters and burn GPU cycles with zero training
+  # steps completed, with no event reported anywhere.
+  #
+  # The array's own default for a new filesystem is false. Portworx sets it to true on every
+  # CreateFileSystem call (PURE_DEFAULT_ENABLE_FB_NFS_SNAPSHOT, default "true"). This is why
+  # every filesystem here has it enabled. This parameter sets it back to false.
+  #
+  # On a throwaway StorageClass and a 1Gi PVC, the driver accepts the parameter, and the array
+  # reports snapshot_directory_enabled=false on the resulting filesystem. This key works for
+  # classic FlashBlade, not only for //EXA.
+  #
+  # THIS ONLY AFFECTS NEWLY CREATED VOLUMES. StorageClass parameters are IMMUTABLE: `oc apply`
+  # over an existing class is rejected. To apply this on a running cluster, delete and recreate
+  # the class. This is safe for bound PVCs, which do not reference the class again, but it blocks
+  # new PVC creation and volume expansion while the class is gone. For volumes that already
+  # exist, patch the array instead:
+  #   curl -sk -X PATCH -H "x-auth-token: $T" \
+  #     "https://<mgmt>/api/2.17/file-systems?names=<fs>" -d '{"snapshot_directory_enabled": false}'
+  # Snapshots are not affected: CSI restore is a management-plane call and never reads .snapshot.
+  pure_fb_snapshot_directory_enabled: "false"
+# ⚠ SET nconnect HERE, NOT ON INDIVIDUAL PVs. THE REASON IS NOT CONVENIENCE.
+#
+# Linux applies nconnect PER (client, server) NFS TRANSPORT. THE FIRST MOUNT WINS. Every volume
+# this driver creates on one array uses the SAME server address. Whichever volume mounts first on
+# a node sets nconnect for every other volume that node will ever mount. Later mounts reuse that
+# value silently, "even if they specify a different one" (documented by SUSE, Oracle, NetApp, and
+# Azure).
+#
+# Setting nconnect here is the only way to make every volume use the same value BY DESIGN.
+# Setting it on individual PVs creates a cluster that is fast on some nodes and slow on others,
+# with nothing in kubectl, in an event, or in any driver log to show you which value a node got.
+# With one PVC and one set of mount options, two GPU nodes can end up with 16 transports on one
+# node and 1 transport on the other, because a monitoring pod had already opened a transport on
+# that node. The workload then runs on the slow node.
+#
+# VERIFY IT TOOK EFFECT WITH num_xprts. DO NOT USE /proc/mounts OR A SOCKET COUNT:
+#   cat /sys/kernel/sunrpc/xprt-switches/*/xprt_switch_info     # -> num_xprts=16 num_active=16
+# nconnect is a property of the shared transport (rpc_xprt), so it does NOT appear in
+# /proc/mounts at all. Established TCP sockets also change with load, because connections open
+# and close on demand. num_xprts is the configured count and is the only clear answer.
+#
+# CHANGING THIS ON A LIVE CLUSTER MEANS RECREATING THE CLASS. mountOptions is immutable on an
+# existing StorageClass. Deleting and recreating the class does NOT affect bound PVs or PVCs, but
+# it blocks new PVC creation and volume expansion for the seconds the class is absent. Existing
+# volumes keep the mount options they were created with. A node that already has a 1-transport
+# switch keeps it until the node is drained or rebooted — restarting the pods that use it is NOT
+# enough.
+#
+# 16 is the kernel's maximum value. Measured effect on this array: about +94% on buffered
+# writes per node — more than adding more nodes (going from 2 to 4 nodes gave +67%).
+mountOptions:
+  - nfsvers=4.1
+  - nconnect=16
+allowVolumeExpansion: true
+# ⚠ reclaimPolicy: Retain IS A DATA-LOSS GUARD ON THIS DRIVER, NOT A RETENTION PREFERENCE.
+# DO NOT CHANGE IT TO Delete. Read this before you decide it is too cautious for scratch volumes.
+#
+# A snapshot restore on this driver does not create a new volume. It reverts the source volume in
+# place and returns a PersistentVolume that carries the SOURCE volume's volumeHandle (contract §3.3).
+# Two problems follow from this:
+#
+#   1. The name collision happens at create time and is reported as SUCCESS. The driver
+#      identifies a volume by its backend id, so a restore collides with the source's existing
+#      object. The only guard checks the filesystem NAME, which also matches, so the mismatch
+#      check never fires and CreateVolume returns success. Two PersistentVolumes now point to
+#      one filesystem, and `kubectl describe pvc` shows nothing about it.
+#   2. Delete works purely by volume id, with no reference count and no check for other
+#      PersistentVolumes using the same handle. The delete path removes the NFS export FIRST.
+#      This breaks every pod mounting it, including the ORIGINAL claim's running pods, and then
+#      soft-deletes the filesystem. The filesystem can then be recovered only from the array's
+#      deleted-item state, within its recovery window.
+#
+# So under `Delete`, deleting EITHER claim — the restored one or the original — breaks the
+# other claim's running pods and destroys the shared filesystem. `Retain` makes delete a no-op
+# against the array. This is the only thing that stops a routine `kubectl delete pvc` from
+# losing a live checkpoint. The driver gives no warning, no Kubernetes event, and no log line at
+# the default log level.
+#
+# This setting exists specifically to prevent that scenario: restored claims that point at live
+# volumes must survive deletion of any claim sharing that volume. Do not change it to Delete.
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+---
+# On-demand snapshot class for checkpoint VolumeSnapshots.
+# deletionPolicy: Retain is deliberate. No code links deletionPolicy to a restore that is in
+# progress, so Retain on the snapshot CONTENT object is the only protection against garbage
+# collection deleting a snapshot mid-restore.
+# (Retained FlashBlade snapshots need manual cleanup on the array. This is intentional.)
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: px-csi-fbda-class
+driver: pxd.portworx.com
+deletionPolicy: Retain

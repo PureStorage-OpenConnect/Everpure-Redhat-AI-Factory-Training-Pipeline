@@ -1,0 +1,292 @@
+# This file resumes training from a saved checkpoint. Training does not restart at step 0.
+#
+# A new RayJob loads an existing ZeRO-3 checkpoint with DeepSpeed. It continues training from
+# the saved global step.
+#
+# WARNING: this storage driver can only roll back a volume. It cannot clone one.
+# A restore reverts the source volume to the snapshot. It does not create a second copy.
+# Do not mount the source volume and a "restored" volume at the same time. This will hang.
+# See ENVIRONMENT-CONTRACT.md §3.3 for the full test record.
+#
+# Rollback-and-resume works end to end, with byte-identical results.
+# Use this three-step process (see docs/rollback-runbook.md "The procedure" for the full detail):
+#   0. Create the VolumeSnapshot itself, via base/30-pipeline/volumesnapshot-ckpt.yaml, if one
+#      does not already exist.
+#   1. A human, or a runbook, creates the PVC that rolls back the volume
+#      (base/30-pipeline/rollback-revert-from-snapshot.yaml).
+#   2. Confirm the revert did what you intended.
+#   3. Only then apply this file.
+# Do not combine these steps into one job. A job must not roll back a live volume as a
+# side effect of starting.
+#
+# This file does not cover a lost volume or a lost array. For that case, restore the checkpoint
+# from its S3 copy. There is no second array copy of the checkpoint today.
+#
+# How this file proves the resume:
+#   * engine.load_checkpoint(RESUME_FROM) restores the model and the ZeRO-3 optimizer shards.
+#     It sets engine.global_steps to the saved step. Rank 0 prints
+#     "RESUMED ... engine.global_steps=N".
+#   * MAX_STEPS=8 runs 8 micro-batches (grad_accum=4, so 2 optimizer steps). global_steps climbs
+#     from N to N+1 to N+2. This shows training continued from N, not from 0.
+#   * SKIP_SAVE=1 stops this run from writing the checkpoint again. This keeps the proof cheap.
+#
+# ================================================================================================
+# WORLD SIZE AND RESUME_FROM
+# ================================================================================================
+# A ZeRO-3 checkpoint is sharded per rank. A job that loads a checkpoint must run at the same
+# world size that saved it. Set NUM_WORKERS (the Ray Train world size) and `replicas` to match
+# the Sensor's NUM_WORKERS in base/20-events/s3-eventsource-sensor.yaml. Change all three together.
+#
+# The values below (8) match the current pipeline. If you resume an older checkpoint saved at
+# world size 4, set NUM_WORKERS and replicas to 4 instead.
+#
+# For reference:
+#   * off the live volume: SUCCEEDED in 27m 38s, global_step 15 -> 16 -> 17.
+#   * off a rolled-back volume: SUCCEEDED in 28m 56s, same climb. All eight per-step losses
+#     matched the run above exactly.
+#
+# RESUME_FROM must point to the real checkpoint path: /mnt/fbda/ckpt-{RUN_ID}. Substitute the
+# real RUN_ID before you apply this file. The placeholder below cannot resolve. An unsubstituted
+# apply fails at load instead of loading the wrong checkpoint. Get the RUN_ID:
+#
+#   oc -n ml-training get rayjob -l ckpt-run-id --sort-by=.metadata.creationTimestamp \
+#      -o jsonpath='{.items[-1:].metadata.labels.ckpt-run-id}'
+#
+# Apply: oc -n ml-training apply -f ../30-pipeline/train-code-configmap.yaml -f rayjob-resume-v5.yaml
+# Watch: oc -n ml-training get rayjob qwen3-fbda-resume-v5 -w
+# This job creates no volumes of its own. There is nothing to clean up after it finishes.
+#
+# WARNING: always use `-n <namespace>`. These manifests set no `metadata.namespace`, because the
+# Kustomize overlay sets it. A bare `oc apply -f` puts the object in your current context's
+# namespace. Kueue then finds no LocalQueue there, and it suspends the job. There is no error and
+# no visible reason. Use `make apply-phase OVERLAY=overlays/<yours> PHASE=<phase>` instead. This
+# command always applies through the overlay.
+---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: qwen3-fbda-resume-v5
+  labels:
+    kueue.x-k8s.io/queue-name: ml-training-lq
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  entrypoint: python -c "import train_qwen3_deepspeed as m; m.main()"
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 5400
+  # PINNED VERSIONS. These pins are not cosmetic.
+  # An unpinned package resolves from PyPI at pod start-up. This puts the bit-identical loss
+  # result at risk from any new release.
+  #
+  # The versions below come from a known-good install log. Do not change them without
+  # testing determinism again.
+  #
+  # TORCH is the biggest risk here, which is exactly why it's pinned explicitly below rather than
+  # left to resolve transitively as a dependency of another package. Pip installs a torch release
+  # to satisfy another package's requirement regardless of whether you pin it yourself; leaving it
+  # unpinned replaces the image's torch 2.7.1+cu128 with whatever's current on PyPI (2.13.0+cu130
+  # as of this writing), pulling in the whole CUDA 13 runtime, 96 extra packages, and about 12
+  # minutes of start-up time. The pin below fixes the resolved version deliberately, including its
+  # triton and CUDA package set.
+  #
+  # torchvision has the same problem: the image ships 0.22.1+cu128, a CUDA-matched build, and pip
+  # upgrades it to a generic release otherwise. Pinned to match torch's CUDA 13 build below.
+  # Test the image's own build before switching back to it.
+  #
+  # These versions must match in four files: this file, the Sensor's RayJob template, and the
+  # two other opt-in manifests (rayjob-eval-v8.yaml, rayjob-train-ephemeral.yaml). Change all four
+  # in the same commit; determinism depends on it.
+  runtimeEnvYAML: |
+    working_dir: /home/ray/train_job
+    pip:
+      - deepspeed==0.19.5
+      - transformers==5.15.0
+      - accelerate==1.14.0
+      - torch==2.13.0
+      - torchvision==0.28.0
+      - nvidia-nccl-cu12==2.29.7
+      - mlflow-skinny==3.15.1
+    pip_check: false
+    env_vars:
+      LD_LIBRARY_PATH: /usr/lib64
+      # Ray 2.52 switched its metrics backend to OpenTelemetry by default. When RAY_USE_TLS is set
+      # (this cluster's KubeRay operator injects it via a create-cert init container on every Ray
+      # pod), the OTEL exporter does not pick up the TLS credentials needed to reach the dashboard
+      # agent's now-TLS gRPC server, so metric export fails — matches
+      # https://github.com/ray-project/ray/issues/59968 exactly, including the affected version
+      # range (2.52+) this file pins. A GPU worker pod's own
+      # /metrics endpoint shows zero ray_* series of any kind — not just the custom
+      # ray_training_* ones — while its dashboard-agent log fills with "SSL_ERROR_SSL: ...
+      # WRONG_VERSION_NUMBER: Invalid certificate verification context". Setting this reverts to
+      # the legacy (pre-OTEL) metrics backend, which has no such TLS dependency; the same pod's
+      # endpoint then correctly shows ray_training_global_step,
+      # ray_training_total_steps and ray_training_steps_completed_total.
+      RAY_enable_open_telemetry: "false"
+      # Ray's default worker-group startup timeout is 30 seconds. This is not long enough here.
+      # Ray Train waits this long for all NUM_WORKERS workers to register, then it fails with:
+      #   ray.train.ControllerError: The worker group startup timed out after 30.0 seconds
+      #   waiting for 8 workers
+      # Installing the runtimeEnvYAML pip packages on every pod can take up to 10 minutes.
+      # This timeout is set to 600 seconds to allow for that.
+      RAY_TRAIN_WORKER_GROUP_START_TIMEOUT_S: "600"
+      RUN_ID: fbda-resume-v5
+      # Substitute the real checkpoint path here. See the file header.
+      # If you do not substitute it, the job fails at load_checkpoint instead of loading the
+      # wrong checkpoint.
+      RESUME_FROM: /mnt/fbda/ckpt-SUBSTITUTE-THE-TRAINING-RUN-ID
+      SKIP_SAVE: "1"
+      MAX_STEPS: "8"
+      # The world size. It must match the Sensor's NUM_WORKERS and the replicas value below.
+      # See the file header.
+      NUM_WORKERS: "8"
+  submitterPodTemplate:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ray-job-submitter
+          image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: train-code
+              mountPath: /home/ray/train_job
+      volumes:
+        - name: train-code
+          configMap:
+            name: train-code
+  rayClusterSpec:
+    rayVersion: "2.52.1"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "0"
+      template:
+        spec:
+          securityContext:
+            # This job mounts a large existing volume. OnRootMismatch skips the recursive chown
+            # when the root already matches the target IDs. This keeps mount time fast, instead
+            # of slow with many files. See base/20-events/s3-eventsource-sensor.yaml for detail.
+            fsGroupChangePolicy: OnRootMismatch
+          nodeSelector:
+            nvidia.com/gpu.present: "true"
+          containers:
+          - name: ray-head
+            image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+            resources:
+              requests:
+                cpu: "2"
+                memory: 24Gi
+              limits:
+                cpu: "2"
+                memory: 24Gi
+            ports:
+            - containerPort: 6379
+              name: gcs-server
+            - containerPort: 8265
+              name: dashboard
+            - containerPort: 10001
+              name: client
+            volumeMounts:
+            - name: fbda-shared
+              mountPath: /mnt/fbda
+          volumes:
+          - name: fbda-shared
+            persistentVolumeClaim:
+              claimName: fbda-shared
+    workerGroupSpecs:
+    - groupName: gpu-worker
+      # 8, not 4. This is the world size that saved the checkpoint, not a capacity choice.
+      # Change it together with NUM_WORKERS above and the Sensor's NUM_WORKERS. See the header.
+      minReplicas: 8
+      maxReplicas: 8
+      replicas: 8
+      rayStartParams:
+        num-gpus: "1"
+      template:
+        spec:
+          securityContext:
+            # This job mounts a large existing volume. OnRootMismatch skips the recursive chown
+            # when the root already matches the target IDs. This keeps mount time fast, instead
+            # of slow with many files. See base/20-events/s3-eventsource-sensor.yaml for detail.
+            fsGroupChangePolicy: OnRootMismatch
+          nodeSelector:
+            nvidia.com/gpu.present: "true"
+          containers:
+          - name: ray-worker
+            image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+            resources:
+              requests:
+                cpu: "6"
+                memory: 180Gi
+                # Qwen3-32B in safetensors is about 65 GB, downloaded to LOCAL_MODEL_DIR
+                # (/tmp/qwen3-32b, train_qwen3_deepspeed.py) on every worker's container
+                # writable layer, not a mounted volume. 90Gi/100Gi covers that plus headroom.
+                ephemeral-storage: 90Gi
+                nvidia.com/gpu: "1"
+              limits:
+                cpu: "6"
+                memory: 400Gi
+                ephemeral-storage: 100Gi
+                nvidia.com/gpu: "1"
+            envFrom:
+            - configMapRef:
+                name: pipeline-config
+            env:
+            - name: S3_ENDPOINT
+              valueFrom: {secretKeyRef: {name: flashblade-s3, key: S3_ENDPOINT}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_ACCESS_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_SECRET_ACCESS_KEY}}
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.ml-training.svc.cluster.local:5000"
+            - name: MLFLOW_EXPERIMENT
+              value: "qwen3-fbda"
+            # NCCL WATCHDOG. Turns a wedged training step into a clear failure instead of a
+            # silent hang: if one rank dies or a network link stalls, the other ranks wait
+            # forever inside a collective op, every pod stays Running/Ready, and
+            # DCGM_FI_DEV_GPU_UTIL reads 100% for a rank stuck waiting — every signal says the
+            # run is healthy. These settings make the monitoring thread stop the process once
+            # the watchdog sees no progress and save a trace of the collective operation that
+            # was running and which ranks never arrived. See the Sensor's embedded RayJob
+            # template (base/20-events/s3-eventsource-sensor.yaml, search TORCH_NCCL) for the
+            # full explanation, including why 1200 seconds and why these stay in `env:` and not
+            # runtimeEnvYAML.
+            - name: TORCH_NCCL_ENABLE_MONITORING
+              value: "1"
+            - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+              value: "1200"
+            - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+              value: "1"
+            - name: TORCH_NCCL_TRACE_BUFFER_SIZE
+              value: "2000"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "3"
+            volumeMounts:
+            - name: fbda-shared
+              mountPath: /mnt/fbda
+            # NCCL's shared-memory transport needs real /dev/shm, not the container
+            # runtime's 64Mi default. 4Gi is not a tight floor here: a run of this
+            # pipeline at this size shows under 1% utilization (33M used of 4Gi) during
+            # real training — evidence of headroom, not a tight floor. Re-check this number
+            # if NCCL SHM usage ever looks tight. This must match the Sensor's embedded
+            # copy and the other RayJob/RayCluster manifests — there is no automated check
+            # for this; it must be kept in sync by hand across all five manifests
+            # (rayjob-eval-v8.yaml, rayjob-train-ephemeral.yaml, rayjob-resume-v5.yaml,
+            # raycluster-fbda-checkpoint.yaml, and the Sensor's embedded copy in
+            # s3-eventsource-sensor.yaml).
+            - name: dev-shm
+              mountPath: /dev/shm
+          volumes:
+          - name: dev-shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 4Gi
+          - name: fbda-shared
+            persistentVolumeClaim:
+              claimName: fbda-shared

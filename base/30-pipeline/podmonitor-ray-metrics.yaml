@@ -1,0 +1,124 @@
+# PodMonitor for the Ray head and worker pods, port 8080.
+#
+# What this connects to: the training script sends metrics through `ray.util.metrics`
+# (`training_global_step`, `training_total_steps`, `training_steps_completed`, and
+# `training_deadline_timestamp` when a deadline is set). Ray shows these as `ray_training_*`,
+# together with its own `ray_*` node metrics. Without a PodMonitor or ServiceMonitor selecting
+# Ray pods, nothing collects these metrics. This file adds that PodMonitor.
+#
+# Why a PodMonitor and not a ServiceMonitor: a ServiceMonitor scrapes through a Service. The
+# RayJob's pods are temporary. The Sensor creates a new RayCluster per S3 object, KubeRay names it
+# with `generateName`, and `shutdownAfterJobFinishes` deletes it minutes after the run ends. No
+# stable Service points at the 8 GPU workers; KubeRay creates a head Service only. A PodMonitor
+# selects pods directly, so it keeps working as clusters are created and removed.
+#
+# Do not set metadata.namespace here, for two reasons. This phase (30-pipeline) sets no
+# namespace on any resource — see that phase's kustomization.yaml — so the overlay sets the
+# namespace at apply time. Also, a PodMonitor must be in the same namespace as the pods it
+# scrapes: user-workload monitoring ignores namespaceSelector and does not allow cross-namespace
+# selection. Compare base/00-platform/servicemonitor-kuberay-operator.yaml, which does set its
+# namespace; that file is in a different phase, with no namespace transformer.
+#
+# This PodMonitor has no effect until user-workload monitoring is on (see
+# ENVIRONMENT-CONTRACT.md §2.1). Platform Prometheus only scrapes namespaces labeled
+# `openshift.io/cluster-monitoring=true`. Without that label, this object collects nothing, even
+# though it looks correctly configured.
+#
+# A worker pod's own /metrics endpoint returns `ray_training_global_step`,
+# `ray_training_total_steps` and `ray_training_steps_completed_total` with the expected labels.
+# This PodMonitor and networkpolicy-ray-metrics-scrape.yaml (in this same directory) provide the
+# scrape path; a worker-side RAY_enable_open_telemetry=false, set in every RayJob manifest, works
+# around Ray 2.52's OpenTelemetry backend failing under this cluster's RAY_USE_TLS — the scrape
+# path being correct does not imply the thing being scraped has anything to export.
+#
+# These facts hold against the live cluster and the operator source:
+#   - Schema: the PodMonitor CRD schema in this cluster matches what this manifest expects.
+#   - Port name: the Sensor's RayJob template sets `{name: metrics, containerPort: 8080}` on the
+#     head and worker pods directly, so this endpoint does not depend on operator defaults.
+#   - Label: KubeRay sets `ray.io/cluster` on head and worker pods, and does not allow a user
+#     template to override it.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ray-metrics
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  # `ray.io/cluster` is set by KubeRay on every pod it creates. Its value is the RayCluster name,
+  # which is different for every Sensor-triggered run. Because the value changes each run, match
+  # with `Exists` instead of a fixed value. This selects every Ray pod in this namespace, for every
+  # run, without the PodMonitor needing to know a run ID.
+  #
+  # base/20-events/s3-eventsource-sensor.yaml reads `metadata.labels['ray.io/cluster']` through
+  # the downward API on the head and worker containers to set RUN_ID, and the training script
+  # refuses to start if that value is empty, so the label is present on every pod by the time
+  # training starts.
+  #
+  # Do not match on the pipeline's own labels (`app.kubernetes.io/part-of`, `trigger`). KubeRay
+  # sets those on the RayJob object, not on the pods it creates. A selector built from them would
+  # look correct but select nothing.
+  selector:
+    matchExpressions:
+      - key: ray.io/cluster
+        operator: Exists
+  podMetricsEndpoints:
+    # `port` names a container port. It is not a port number and not a Service port. Both Ray
+    # containers declare `- {containerPort: 8080, name: metrics}` in the Sensor's RayJob template,
+    # and both set `metrics-export-port: "8080"` in rayStartParams.
+    #
+    # These declarations are extra safety, not a requirement. KubeRay adds a container port named
+    # `metrics` on 8080 to any Ray container that does not already have one (per the operator
+    # source, `DefaultHeadPodTemplate`/`DefaultWorkerPodTemplate`, unchanged from kuberay v1.1.0
+    # to v1.6.0). So this PodMonitor finds its targets on any Ray pod in this namespace, whether
+    # or not the Sensor's RayJob template declares the port itself.
+    - port: metrics
+      path: /metrics
+      scheme: http
+      # Set this to 30s, matching the other monitors in this tree. This pipeline exports a step
+      # counter and a deadline gauge over a run of about 2.5 hours. A shorter interval adds no
+      # value and increases load across the 9 targets each run creates.
+      interval: 30s
+      # Set filterRunning to true. This restates the CRD default and drops FINISHED pods, not
+      # Pending ones. The CRD schema says: pods that are not running (Failed or Succeeded) are
+      # dropped from target discovery when this is unset or true.
+      #
+      # This matters here because the pipeline produces such pods often. KubeRay keeps the
+      # RayCluster for `ttlSecondsAfterFinished` (measured at exactly 600 seconds) after the job
+      # ends. For 10 minutes after every run, 9 Succeeded pods still carry `ray.io/cluster` and
+      # still match the selector above. Without this setting, those 9 targets would show DOWN at
+      # the end of every successful run.
+      #
+      # This setting does not cover a pod stuck in Pending. That pod stays selected and shows
+      # DOWN, which is correct. FbdaPodPendingTooLong is the alert for that case; it reads
+      # kube_pod_status_phase, not this metric.
+      filterRunning: true
+# Verify this after a run. An empty result and a healthy result look the same otherwise.
+#   - Run: oc -n <your-namespace> get podmonitor ray-metrics
+#   - In the console: Observe -> Targets, filter on `ray-metrics`. Expect 9 targets UP
+#     (1 head + 8 workers).
+#   - In the console: Observe -> Metrics, as a namespace user (not the platform tier).
+#     `count({__name__=~"ray_.*"})` must be non-zero during a run.
+#     `ray_training_global_step` shows data for rank 0 only. This is by design; see the
+#     training script.
+#
+# If the target list is empty, check these in order:
+#   - User-workload monitoring is off.
+#   - The pods have no port named `metrics`.
+#   - The pods have no `ray.io/cluster` label.
+# Run `oc get pod -l ray.io/cluster -o jsonpath='{.items[*].spec.containers[*].ports}'` to check
+# the last two at once.
+#
+# base/40-workloads is also in scope. This selector matches every Ray pod in the namespace,
+# including the standing RayCluster and the worked-example RayJobs in that opt-in phase. None of
+# them declares a container port named `metrics`, so whether they show up as targets depends only
+# on the operator adding that port automatically; see the note on `port` above. They may or may
+# not appear in the Targets page; either way, this does not affect the main pipeline's own run,
+# because those pods do declare the port.
+#
+# These other manifests ARE covered by this selector — do not assume they need a separate
+# PodMonitor or a separate scrape path.
+#
+# If you run those other manifests for real and want the port contract visible in the manifest
+# itself, add `- {containerPort: 8080, name: metrics}` and `metrics-export-port: "8080"` to each
+# Ray container, the same way base/20-events/s3-eventsource-sensor.yaml does. This makes the
+# manifest easier to read; it does not fix a defect.

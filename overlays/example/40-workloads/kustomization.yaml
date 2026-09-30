@@ -1,0 +1,71 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# This overlay is optional. It is not part of the four-phase apply sequence. See base/40-workloads.
+# If you apply this, it uses GPU quota immediately.
+
+namespace: ml-training
+
+resources:
+  - ../../../base/40-workloads
+
+# ---------------------------------------------------------------------------------------------
+# PIN THE GPU MODEL IF YOUR FLEET HAS DIFFERENT GPU TYPES.
+#
+# The base ResourceFlavor uses the label `nvidia.com/gpu.present: "true"`. Node Feature Discovery
+# sets this label on every CUDA-capable node (contract §7). This label works if every GPU node
+# can run the job. It does not work if VRAM differs: a 32B model in full-parameter fine-tuning
+# via ZeRO-3 with full CPU offload can land on a small GPU, start, run, and then fail partway
+# through the job.
+#
+# The opposite mistake is quieter. If you pin a label that no node has, the pods stay `Pending`
+# forever. Kubernetes does not report an error for this. If a run appears to do nothing, check
+# `oc get pod -o wide` and the node labels first.
+#
+# This directory has four resources. Each has a head pod and a worker group, so there are eight
+# pod specs in total. Also pin the ResourceFlavor (see overlays/example/00-platform). Kueue adds
+# the flavor's nodeLabels at admission time. If the ResourceFlavor and these pod specs disagree,
+# you get the same empty-node-set problem again.
+#
+# patches:
+#   - target: {group: ray.io, version: v1, kind: RayCluster, name: qwen3-fbda}
+#     patch: |-
+#       - op: replace
+#         path: "/spec/headGroupSpec/template/spec/nodeSelector"
+#         value: {nvidia.com/gpu.product: NVIDIA-H100-PCIe}
+#       - op: replace
+#         path: "/spec/workerGroupSpecs/0/template/spec/nodeSelector"
+#         value: {nvidia.com/gpu.product: NVIDIA-H100-PCIe}
+#   - target: {group: ray.io, version: v1, kind: RayJob, name: .*}
+#     patch: |-
+#       - op: replace
+#         path: "/spec/rayClusterSpec/headGroupSpec/template/spec/nodeSelector"
+#         value: {nvidia.com/gpu.product: NVIDIA-H100-PCIe}
+#       - op: replace
+#         path: "/spec/rayClusterSpec/workerGroupSpecs/0/template/spec/nodeSelector"
+#         value: {nvidia.com/gpu.product: NVIDIA-H100-PCIe}
+#
+# Use JSON6902 `replace`, not a strategic merge. `nodeSelector` is a map inside a CRD, so
+# kustomize has no merge schema for it. A merge adds your key next to `gpu.present` instead of
+# replacing it. Then both keys must match, which can cause the same empty-node-set problem.
+#
+# ---------------------------------------------------------------------------------------------
+# WORKER COUNT AND RESOURCES MATCH THE DEFAULT CONFIGURATION.
+#
+# The default setup uses 4 worker replicas at 1 GPU each, plus the head pod. The quota is 8
+# GPUs, 56 CPU, 1600Gi memory, and 720Gi ephemeral-storage (90Gi per GPU worker). This applies to
+# the two resources that only write checkpoints (`raycluster-fbda-checkpoint.yaml` and
+# `rayjob-train-ephemeral.yaml`). If your quota or node shape is different, change all of it
+# together: the ClusterQueue in 00-platform (all four resources, ephemeral-storage included) and
+# the worker counts here.
+#
+# The two resources that load a checkpoint (`rayjob-eval-v8.yaml` and `rayjob-resume-v5.yaml`)
+# are not free to resize. They use 8 workers because a ZeRO-3 checkpoint is split by rank. The
+# number of workers that load it must equal the number that saved it (the Sensor's
+# `NUM_WORKERS`, which is 8). Change these only together with the Sensor. Read the header in
+# `rayjob-eval-v8.yaml` first. At 8 workers, either job uses the whole GPU quota alone.
+#
+# If your quota is too small, the job does not fail — it hangs. Kueue holds the workload as
+# unadmitted. No error appears on the RayJob and no event appears on the pod, because no pod
+# exists yet. If a run does nothing at all, check ClusterQueue admission first.
+# ---------------------------------------------------------------------------------------------

@@ -1,0 +1,56 @@
+# ServiceMonitor for the KubeRay operator (port 8080).
+#
+# The operator has served metrics on port 8080, through an existing Service, but nothing has
+# ever scraped it.
+#
+# THIS SERVICEMONITOR DOES NOTHING UNTIL USER-WORKLOAD MONITORING (UWM) IS ON. Platform
+# Prometheus scrapes only namespaces labelled `openshift.io/cluster-monitoring=true`. The
+# `redhat-ods-applications` namespace does not have this label. Apply
+# cluster-monitoring-config.yaml first. Otherwise this object looks configured but collects
+# nothing — the same namespace-mismatch failure the Kueue ServiceMonitor had in this namespace.
+#
+# THE NAMESPACE MUST STAY EXPLICIT. A ServiceMonitor scrapes targets only in its own namespace.
+# UWM ignores `namespaceSelector` and does not allow cross-namespace selection. So this object
+# must live beside its Service. Phase 00-platform runs no namespace transformer, which is why
+# this file sets the namespace directly instead of relying on an overlay.
+#
+# `redhat-ods-applications` is where RHOAI installs KubeRay. If you run upstream KubeRay
+# through Helm instead, the operator lives in `ray-system`. Change both the namespace and,
+# if the Service names its port differently, the `port:` value below. `port` is the Service
+# port name, not the container port and not a number. A wrong value gives zero targets with
+# no error.
+#
+# WHAT THIS ENDPOINT SERVES, AND WHAT IT DOES NOT.
+#   - This endpoint serves only controller-runtime and workqueue
+#     metrics: controller_runtime_reconcile_errors_total, controller_runtime_reconcile_time_seconds,
+#     workqueue_depth, workqueue_longest_running_processor_seconds, leader_election_master_status,
+#     plus go_*/process_*.
+#   - This has real value. A stalled reconcile loop or a growing workqueue is the operator-side
+#     sign that RayJobs are not progressing.
+#   - `kuberay_job_deployment_status` is not exported by this operator version. It does not
+#     appear on the endpoint. Do not write an alert against that metric and expect it to fire.
+#     Check your own operator version's endpoint before you rely on any metric.
+#
+# Verify:
+#   - Console -> Observe -> Targets, filter `kuberay` -> should show 1 target UP
+#   - or: `count(controller_runtime_reconcile_total{job="kuberay-operator"})` > 0
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kuberay-operator-metrics
+  namespace: redhat-ods-applications
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  # This selector matches the Service `kuberay-operator`. That Service also carries ODH-specific
+  # labels (app.opendatahub.io/ray, platform.opendatahub.io/part-of) that an upstream KubeRay
+  # install does not have. This selector uses only the two labels that work on both.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kuberay
+      app.kubernetes.io/component: kuberay-operator
+  endpoints:
+    - port: monitoring-port
+      path: /metrics
+      scheme: http
+      interval: 30s

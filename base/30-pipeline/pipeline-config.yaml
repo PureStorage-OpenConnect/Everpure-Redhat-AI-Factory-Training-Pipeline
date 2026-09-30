@@ -1,0 +1,43 @@
+# Bucket names are overlay-settable configuration, not literals in the code.
+#
+# Do not hard-code a bucket name that belongs to the customer's environment. A customer's
+# buckets have their own names. If a manifest and the training source disagree about a
+# bucket name, the pipeline deploys but fails at download_model(). Set the name once, here.
+#
+# Override in your overlay:
+#   configMapGenerator:                  # or a plain patch
+#     - name: pipeline-config
+#       behavior: merge
+#       literals: [S3_DATA_BUCKET=my-bucket]
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+data:
+  # Base model and training dataset source. The training job reads this bucket.
+  # my-models is a placeholder, matching README's Minimum configuration example —
+  # replace it in your overlay, do not apply this default as-is.
+  S3_DATA_BUCKET: my-models
+  # Trigger inbox. The S3 poller watches this bucket only.
+  # Use a different value than S3_DATA_BUCKET. If the two match, every dataset
+  # upload starts a training run. See ENVIRONMENT-CONTRACT.md section 4.
+  # my-inbox is a placeholder — replace it in your overlay.
+  S3_VALIDATION_BUCKET: my-inbox
+  # Write-once model lineage. Use versioning and object-lock for this bucket.
+  # my-registry is a placeholder — replace it in your overlay.
+  S3_REGISTRY_BUCKET: my-registry
+  # --- prefixes within S3_VALIDATION_BUCKET -------------------------------------------------
+  # The poller and the canary (pipeline-canary-cronjob.yaml) must agree on these three
+  # prefix values. If the values drift apart, the poller reports new-objects-fired=0.
+  #
+  # The dataset inbox. A new object under this prefix starts a real GPU training run.
+  S3_VALIDATION_PREFIX: incoming/
+  # The canary's own prefix. Keep it separate from the inbox. This keeps synthetic
+  # canary objects out of the list of datasets that a person reviews.
+  S3_CANARY_PREFIX: canary/
+  # Where the poller stores its dedupe state (key and etag), as an object in this
+  # bucket. The poller needs no PVC and no extra RBAC because of this. The canary
+  # reads this object to confirm the poller saw and processed its test object.
+  S3_POLLER_STATE_KEY: .poller-state/seen.tsv

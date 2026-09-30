@@ -1,0 +1,41 @@
+# Kueue ResourceFlavor: the node class that this pipeline's GPU work is admitted onto.
+#
+# THIS FLAVOR IS DELIBERATELY NOT NAMED AFTER A GPU MODEL. Naming a flavor after a specific
+# GPU model (for example `nodeLabels: {nvidia.com/gpu.product: NVIDIA-L40S}`) is a fact about
+# one cluster, not a property of the pipeline. Building that into the base means every adopter
+# using a different GPU model inherits a selector that matches none of their nodes. A
+# nodeSelector that matches no node does not fail with an error. The pods stay `Pending`
+# forever, with no event that explains why.
+#
+# `nvidia.com/gpu.present` comes from Node Feature Discovery, which the environment contract
+# already requires (contract §7). It is true on every CUDA-capable node, regardless of model.
+# So the default admits GPU nodes and does not say which GPU model.
+#
+# NARROW THIS IF YOUR GPU NODES ARE NOT INTERCHANGEABLE.
+#
+# The default works if every GPU node can run the workload. It does not work on a mixed fleet:
+# this pipeline does full-parameter fine-tuning of a 32B model via ZeRO-3 with full CPU offload,
+# which needs enough VRAM, and `gpu.present` can place it on the smallest card you own. That
+# failure is worse than Pending. The job starts, runs, and fails during the job.
+#
+# To pin a GPU model, set the label in your overlay:
+#
+#   patches:
+#     - target: {group: kueue.x-k8s.io, version: v1beta1, kind: ResourceFlavor, name: gpu}
+#       patch: |-
+#         - op: replace
+#           path: /spec/nodeLabels
+#           value:
+#             nvidia.com/gpu.product: NVIDIA-H100-PCIe
+#
+# Kueue adds a flavor's `nodeLabels` to the pod spec at admission time, so pinning here covers
+# every workload admitted through the queue. The pod specs in `base/40-workloads` and the
+# Sensor's RayJob template also carry `nvidia.com/gpu.present`, as an extra explicit check.
+# Narrow those in the same overlay if you narrow this. `overlays/example/40-workloads` shows how.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: gpu
+spec:
+  nodeLabels:
+    nvidia.com/gpu.present: "true"

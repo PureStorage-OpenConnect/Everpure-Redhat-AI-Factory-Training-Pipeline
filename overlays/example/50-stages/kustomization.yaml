@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# OPT-IN. Not part of the standard sequence — these Jobs need artifacts from a completed run.
+
+namespace: ml-training
+
+resources:
+  - ../../../base/50-stages

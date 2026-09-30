@@ -1,0 +1,336 @@
+---
+# FlashBlade array-side preparation for the training pipeline.
+#
+# WHAT THIS DOES. This is the only playbook in this tree that runs against the FlashBlade
+# array. Everything else runs inside OpenShift.
+#
+# WHAT THIS DOES NOT DO:
+#
+#   * It does not create the pipeline's data volumes. Portworx creates one FlashBlade
+#     filesystem per PersistentVolumeClaim, at PVC-create time. This playbook creates only
+#     one filesystem: a throwaway probe, described below.
+#   * It does not create the array API token that px-pure-secret needs. The array shows a
+#     token's value only once, at creation. Create the token by hand. See the README.
+#   * It does not create an S3 access key, for the same reason. See the S3 section below.
+#   * It does not configure array networking. The NFS data VIP and the management VIP are
+#     facts about your installation. This playbook verifies them, but cannot create them.
+#
+# SAFETY. Run with `--check` first. Without `-e fbda_confirm_apply=true`, the play fails at
+# the first task and makes no changes. Every module used here supports check mode.
+#
+# CREDENTIALS. No secret value is stored in this tree. By default, the API token and the
+# management endpoint come from the environment:
+#
+#   export PUREFB_URL=<your FlashBlade management VIP or hostname>
+#   export PUREFB_API=<the T-... token from the Storage Admin user you created>
+#   ansible-playbook flashblade-prepare.yml -e @vars/flashblade-example.yml --check
+#
+# You can override these with `-e` or a vault-encrypted var file instead.
+#
+# See the README beside this file for prerequisites and the full run procedure.
+
+- name: Prepare a FlashBlade for the FBDA training pipeline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Connection settings. Defaults come from the environment, so no credential is in a file.
+    fbda_fb_url: "{{ lookup('ansible.builtin.env', 'PUREFB_URL') }}"
+    fbda_fb_api_token: "{{ lookup('ansible.builtin.env', 'PUREFB_API') }}"
+    # FlashBlade ships with a self-signed management certificate. Keep this true until you
+    # install your own certificate.
+    fbda_disable_tls_warnings: true
+
+    # Write gate. See SAFETY above.
+    fbda_confirm_apply: false
+
+    # The NFS data VIP the cluster nodes mount through. This playbook verifies it; it does
+    # not create it.
+    fbda_nfs_data_vip: ""
+
+    # The throwaway NFS probe filesystem. It is small. Delete it yourself when you finish.
+    fbda_probe_filesystem: fbda-preflight-probe
+    fbda_probe_size: 1G
+    fbda_probe_export_rules: "*(rw,no_root_squash)"
+
+    # Object store names. Change them if you want. These match the roles in contract §4.
+    fbda_s3_account: fbda-pipeline
+    fbda_s3_user: fbda-pipeline
+    fbda_s3_bucket_training: my-models
+    fbda_s3_bucket_validation: my-inbox
+    fbda_s3_bucket_registry: my-registry
+
+    # Default retention applied to the registry bucket below, in days. object_lock_enabled alone
+    # only turns the object-lock CAPABILITY on; nothing is actually locked until either the
+    # bucket has a default retention (this) or a PUT specifies its own retention parameters.
+    # 2555 days (~7 years) is a conservative floor consistent with common model-risk-management /
+    # audit-record retention practice — this repo states no retention policy of its own. Override
+    # in your vars file if your compliance policy states a different period.
+    fbda_s3_registry_retention_days: 2555
+
+  module_defaults:
+    group/everpure.flashblade.everpure.flashblade:
+      fb_url: "{{ fbda_fb_url }}"
+      api_token: "{{ fbda_fb_api_token }}"
+      disable_warnings: "{{ fbda_disable_tls_warnings }}"
+
+  # Every preflight task below carries the tag `always`. Do not remove this tag.
+  # Ansible skips an untagged task whenever you pass --tags. Without `always`, a command such
+  # as `--tags s3` would skip the opt-in check and the credential check, and would write to
+  # the array with no safety check at all.
+  pre_tasks:
+
+    - name: Preflight | Require an explicit opt-in before writing to the array
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode or (fbda_confirm_apply | bool)
+        fail_msg: >-
+          Refusing to run against a real array without an explicit opt-in.
+          Run with --check first, read the diff, then re-run with -e fbda_confirm_apply=true.
+        success_msg: >-
+          {{ 'Check mode: no array writes will be issued.' if ansible_check_mode
+             else 'Apply mode: array writes WILL be issued.' }}
+      tags:
+        - always
+
+    - name: Preflight | Require a management endpoint and an API token
+      ansible.builtin.assert:
+        that:
+          - fbda_fb_url | length > 0
+          - fbda_fb_api_token | length > 0
+        fail_msg: >-
+          Set PUREFB_URL to the FlashBlade management VIP and PUREFB_API to a Storage Admin
+          API token, or override fbda_fb_url / fbda_fb_api_token. The token value is never
+          read back from the array, so it must come from wherever you stored it at creation.
+      tags:
+        - always
+
+    - name: Preflight | Require the NFS data VIP to be named
+      ansible.builtin.assert:
+        that:
+          - fbda_nfs_data_vip | length > 0
+        fail_msg: >-
+          Set fbda_nfs_data_vip to the NFS data VIP your cluster nodes will mount through.
+          It is a different address from the management endpoint and frequently on a different
+          network — that distinction is the subject of contract §12.4.
+      tags:
+        - always
+
+  tasks:
+
+    # ---------------------------------------------------------------------------------------
+    # 1. VERIFY THE ARRAY AND THE DATA VIP
+    #
+    # A management endpoint that answers, and a data VIP that responds to ping, do not prove
+    # they belong to the same array. If px-pure-secret points at one array's management
+    # endpoint and a different array's data VIP, volume creation fails with
+    # "Failed to create volume: : not found". This looks like a CSI bug. It is not.
+    # See contract §12.7.
+    # ---------------------------------------------------------------------------------------
+
+    - name: Verify | Read array identity and network interfaces
+      everpure.flashblade.purefb_info:
+        gather_subset:
+          - minimum
+          - network
+      register: fbda_array_info
+      tags:
+        - verify
+
+    - name: Verify | Report the array this token authenticates against
+      ansible.builtin.debug:
+        msg: >-
+          Authenticated to array '{{ fbda_array_info.purefb_info.default.flashblade_name
+          | default('unknown') }}' running Purity//FB
+          {{ fbda_array_info.purefb_info.default.purity_version | default('unknown') }}.
+      tags:
+        - verify
+
+    - name: Verify | The NFS data VIP is a data-service interface on THIS array
+      ansible.builtin.assert:
+        that:
+          - fbda_matching_interfaces | length > 0
+        fail_msg: >-
+          {{ fbda_nfs_data_vip }} is not a data-service interface on the array reached at
+          {{ fbda_fb_url }}. Either the address is wrong, or it belongs to a DIFFERENT
+          FlashBlade — which is the failure contract §12.1 describes, and it presents as an
+          unrelated CSI error much later. Interfaces carrying the 'data' service on this array:
+          {{ fbda_data_interfaces | default([]) | join(', ') }}
+        success_msg: >-
+          {{ fbda_nfs_data_vip }} is a data-service interface on this array.
+      vars:
+        fbda_interfaces: "{{ fbda_array_info.purefb_info.network | default({}) }}"
+        fbda_data_interfaces: >-
+          {{ fbda_interfaces | dict2items
+             | selectattr('value.services', 'defined')
+             | selectattr('value.services', 'contains', 'data')
+             | map(attribute='value.address') | select('string') | list }}
+        fbda_matching_interfaces: >-
+          {{ fbda_data_interfaces | select('equalto', fbda_nfs_data_vip) | list }}
+      tags:
+        - verify
+
+    # ---------------------------------------------------------------------------------------
+    # 2. THE NFS PROBE FILESYSTEM
+    #
+    # Portworx creates the pipeline's real filesystems itself. This probe filesystem lets you
+    # check two array-side settings before you install Portworx, when a mistake costs little:
+    #
+    #   * Export rules must be `*(rw,no_root_squash)`. This is required, not just a good
+    #     default. With root_squash, the kubelet's fsGroup walk still visits every file, but
+    #     each lchown call fails with EPERM, so the volume root never gets the correct owner.
+    #     See the comment in base/10-storage/storageclass-snapclass-px-csi.yaml.
+    #   * `snapshot_directory_enabled` must be false. A new filesystem defaults to false on
+    #     the array, but the CSI driver sets it to true on every create. The StorageClass
+    #     parameter sets it back to false.
+    #
+    # To use the probe: mount it from a node, confirm a root-owned write succeeds, confirm
+    # `.snapshot` is absent, then delete it. It is not part of the running pipeline.
+    # ---------------------------------------------------------------------------------------
+
+    - name: Probe | Create the throwaway NFS probe filesystem
+      everpure.flashblade.purefb_fs:
+        name: "{{ fbda_probe_filesystem }}"
+        size: "{{ fbda_probe_size }}"
+        state: present
+        nfsv3: false
+        nfsv4: true
+        smb: false
+        http: false
+        # nfs_rules is deprecated in favor of export_policy. It is used here on purpose: the
+        # StorageClasses set per-volume rules with `pure_export_rules`, which conflicts with
+        # the policy-based method. The probe must match what the pipeline actually does.
+        nfs_rules: "{{ fbda_probe_export_rules }}"
+        # WARNING: this is why this playbook creates a new filesystem instead of changing one.
+        # The collection's modify action can only turn the snapshot directory ON. Setting it
+        # to false on an existing filesystem that has it enabled does nothing, silently.
+        # A Portworx volume must get the correct setting at creation, from the StorageClass.
+        snapshot: false
+      tags:
+        - nfs
+        - probe
+
+    # ---------------------------------------------------------------------------------------
+    # 3. OBJECT STORE: ACCOUNT, THREE BUCKETS, ONE USER
+    #
+    # FlashBlade's S3 service is a separate Purity feature. It does not depend on Portworx.
+    # This section is the array-side half of contract §4.
+    #
+    # The three buckets are separate on purpose. The poller watches the validation bucket.
+    # The training job reads the training bucket. If both point at one bucket, every dataset
+    # upload starts a training run.
+    # ---------------------------------------------------------------------------------------
+
+    - name: S3 | Create the object store account
+      everpure.flashblade.purefb_s3acc:
+        name: "{{ fbda_s3_account }}"
+        state: present
+      tags:
+        - s3
+
+    - name: S3 | Create the training-data and validation-drop buckets
+      everpure.flashblade.purefb_bucket:
+        name: "{{ item }}"
+        account: "{{ fbda_s3_account }}"
+        state: present
+      loop:
+        - "{{ fbda_s3_bucket_training }}"
+        - "{{ fbda_s3_bucket_validation }}"
+      tags:
+        - s3
+
+    - name: S3 | Create the model-registry bucket with versioning and object lock
+      everpure.flashblade.purefb_bucket:
+        name: "{{ fbda_s3_bucket_registry }}"
+        account: "{{ fbda_s3_account }}"
+        state: present
+        # Model lineage is write-once. The contract recommends this; it does not require it.
+        # It is enabled here because turning it on later means you must re-upload the history.
+        versioning: enabled
+        object_lock_enabled: true
+        # object_lock_enabled above only turns the object-lock CAPABILITY on. S3 Object Lock
+        # makes an object immutable only if EITHER the bucket has a default retention configured
+        # (this) OR the PUT itself specifies retention parameters. Without one of the two,
+        # nothing actually prevents an overwrite or delete of a "SafeMode" lineage record, no
+        # matter what this pipeline's docs say elsewhere. retention_mode: compliance is the
+        # strictest mode this module exposes — once set, Pure Technical Support (the vendored module's own term for this — not one this repo chose) is the only way
+        # to loosen it, matching the "immutable once written" language in
+        # base/50-stages/v9-register-job.yaml.
+        retention_mode: compliance
+        default_retention: "{{ fbda_s3_registry_retention_days }}"
+        # THIS ONLY TAKES EFFECT ON A BUCKET THIS TASK CREATES. In the vendored
+        # everpure.flashblade module (purefb_bucket.py), object_lock_config is
+        # constructed only in the create path (BucketPost). The update path (BucketPatch, hit
+        # when the bucket already exists) never writes object_lock_config at all — it only reads
+        # the live value back and module.warn()s if retention_mode/default_retention don't match
+        # what you asked for, because Pure Technical Support (see above) is the only way to change
+        # retention on an existing bucket. If `my-registry` already existed before this task was
+        # added, re-running this playbook against it changes nothing and warns silently into
+        # Ansible's own output — it does not fail, and does not retroactively lock anything.
+        # Check with `aws s3api get-object-lock-configuration --bucket <name>` after first run;
+        # if it's empty, either recreate the bucket (only safe if nothing has been registered to
+        # it yet) or contact Technical Support to set retention on the existing one.
+      tags:
+        - s3
+
+    - name: S3 | Create the object store user
+      everpure.flashblade.purefb_s3user:
+        name: "{{ fbda_s3_user }}"
+        account: "{{ fbda_s3_account }}"
+        state: present
+        # Do not set access_key here. See the access-key check below for the reason.
+      tags:
+        - s3
+
+    # ---------------------------------------------------------------------------------------
+    # 4. ACCESS-KEY SLOT CHECK — READ-ONLY
+    #
+    # This playbook does not create the S3 access key. The array shows a key's secret only
+    # once, at creation. If Ansible created the key, the secret would end up in Ansible's
+    # output: a terminal, a log file, or a job record. This risks putting a live credential
+    # into a repository that ships none.
+    #
+    # A FlashBlade object store user can have a maximum of 2 access keys at one time. If you
+    # create a key and lose its secret, that key still occupies a slot. With both slots used,
+    # the next attempt fails with "Maximum Access Key count reached", and can return an empty
+    # result instead of an error.
+    #
+    # This task only counts the slots and reports them. A human creates the key by hand.
+    # ---------------------------------------------------------------------------------------
+
+    - name: S3 | Read existing access keys for the pipeline user
+      everpure.flashblade.purefb_info:
+        gather_subset:
+          - accounts
+      register: fbda_account_info
+      tags:
+        - s3
+
+    - name: S3 | Report access-key slot usage and the remaining manual steps
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Access keys already on {{ fbda_s3_account }}/{{ fbda_s3_user }}:
+            {{ fbda_existing_keys | length }} of 2 slots used.
+          - >-
+            {{ 'BOTH SLOTS ARE IN USE. Remove a key you no longer hold the secret for before
+            minting a new one, or the next attempt fails.'
+            if fbda_existing_keys | length >= 2 else
+            'A slot is free. Mint the key from the array UI or CLI, capture the secret at that
+            moment, and load it into the flashblade-s3 Secret named in contract §5.' }}
+          - >-
+            Still manual, by design: the Storage Admin API token for px-pure-secret, the S3
+            access key above, and attaching an object-store access policy to the user. The
+            README beside this playbook gives the exact steps and says why each one is manual.
+      vars:
+        # Use ['keys'], not .keys. Jinja2 tries attribute access first, so `dict.keys`
+        # resolves to Python's built-in `dict.keys` method, not the array's "keys" entry.
+        # `.keys | length` then always returns 55, the length of that method's string form,
+        # no matter how many keys the user actually has — a user with 0 keys shows as "55 of
+        # 2 slots used". Use `['keys']` to get the real list.
+        fbda_existing_keys: >-
+          {{ fbda_account_info.purefb_info.accounts[fbda_s3_account].users[fbda_s3_user]['keys']
+             | default([]) }}
+      tags:
+        - s3

@@ -1,0 +1,175 @@
+# This manifest creates a standing RayCluster (qwen3-fbda) with 4 GPU workers.
+# It is not part of the autonomous pipeline. The S3 sensor in base/20-events creates
+# RayJobs for the pipeline on demand instead.
+#
+# WARNING: applying this uses 4 of the 8 GPUs in the ClusterQueue quota. This starves
+# the pipeline. Apply this only if you need the manual-submit cluster.
+#
+# The fbda-shared PVC lives in base/30-pipeline/pvc-fbda-shared.yaml. Apply that file
+# before this one, the same order the phase kustomization already uses.
+#
+# Apply: oc -n ml-training apply -f ../30-pipeline/pvc-fbda-shared.yaml -f raycluster-fbda-checkpoint.yaml
+# Watch: oc -n ml-training get raycluster qwen3-fbda -w
+# Down:  oc -n ml-training delete raycluster qwen3-fbda    # releases the 4 GPUs
+#
+# WARNING: the `-n` flag is not optional. Without it, the command fails silently. This
+# manifest sets no `metadata.namespace`; the Kustomize overlay sets it. A bare `oc apply -f`
+# puts the RayCluster in your current context's namespace, where `fbda-shared` does not
+# exist. The head pod then never mounts its volume. Use
+# `make apply-phase OVERLAY=overlays/<yours> PHASE=40-workloads` instead; it sets the
+# namespace correctly.
+#
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: qwen3-fbda
+  labels:
+    kueue.x-k8s.io/queue-name: ml-training-lq
+spec:
+  rayVersion: "2.52.1"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"
+    template:
+      spec:
+        securityContext:
+          # This job mounts a large existing volume. OnRootMismatch skips the recursive chown
+          # when the root already matches the target IDs. This keeps mount time fast, instead
+          # of slow with many files. See base/20-events/s3-eventsource-sensor.yaml for detail.
+          fsGroupChangePolicy: OnRootMismatch
+        nodeSelector:
+          nvidia.com/gpu.present: "true"
+        containers:
+        - name: ray-head
+          image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+          resources:
+            requests:
+              cpu: "2"
+              memory: 24Gi
+            limits:
+              cpu: "2"
+              memory: 24Gi
+          # This is a bare RayCluster, not a RayJob, so there is no runtimeEnvYAML to carry this
+          # setting the way the four RayJob manifests do — see train/train_qwen3_deepspeed.py's
+          # "Run telemetry" header for detail (Ray 2.52's OpenTelemetry metrics
+          # backend fails under this cluster's RAY_USE_TLS). Set on both head and worker: the
+          # KubeRay operator injects RAY_USE_TLS on every pod in a RayCluster, not only workers.
+          env:
+          - name: RAY_enable_open_telemetry
+            value: "false"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          volumeMounts:
+          - name: fbda-shared
+            mountPath: /mnt/fbda
+        volumes:
+        - name: fbda-shared
+          persistentVolumeClaim:
+            claimName: fbda-shared
+  workerGroupSpecs:
+  - groupName: gpu-worker
+    minReplicas: 4
+    maxReplicas: 4
+    replicas: 4
+    rayStartParams:
+      num-gpus: "1"
+    template:
+      spec:
+        securityContext:
+          # This job mounts a large existing volume. OnRootMismatch skips the recursive chown
+          # when the root already matches the target IDs. This keeps mount time fast, instead
+          # of slow with many files. See base/20-events/s3-eventsource-sensor.yaml for detail.
+          fsGroupChangePolicy: OnRootMismatch
+        nodeSelector:
+          nvidia.com/gpu.present: "true"
+        containers:
+        - name: ray-worker
+          image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+          resources:
+            requests:
+              cpu: "6"
+              # Kueue admits pods based on the requests value. The ml-training-cq
+              # ClusterQueue caps memory at 1600Gi (head 24Gi + 4x180Gi = 744Gi fits).
+              # Ray's OOM monitor uses the cgroup limit instead. The ZeRO-3 CPU-offload
+              # step for the 32B model needs about 115GB, so only the limit is raised,
+              # to 400Gi, for headroom.
+              memory: 180Gi
+              # Qwen3-32B in safetensors is about 65 GB, downloaded to LOCAL_MODEL_DIR
+              # (/tmp/qwen3-32b, train_qwen3_deepspeed.py) on every worker's container
+              # writable layer, not a mounted volume. 90Gi/100Gi covers that plus headroom.
+              ephemeral-storage: 90Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: 400Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/gpu: "1"
+          envFrom:
+          - configMapRef:
+              name: pipeline-config
+          env:
+          - name: RAY_enable_open_telemetry
+            value: "false"
+          - name: S3_ENDPOINT
+            valueFrom: {secretKeyRef: {name: flashblade-s3, key: S3_ENDPOINT}}
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_ACCESS_KEY_ID}}
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_SECRET_ACCESS_KEY}}
+          # World-rank-0 (a worker pod) logs parameters and per-step loss to the
+          # in-cluster MLflow server (base/30-pipeline/mlflow-server.yaml). This uses the
+          # in-cluster Service DNS, not the Route. This setting is optional: if the
+          # server is unreachable, train_qwen3_deepspeed.py::_init_mlflow does nothing.
+          - name: MLFLOW_TRACKING_URI
+            value: "http://mlflow.ml-training.svc.cluster.local:5000"
+          - name: MLFLOW_EXPERIMENT
+            value: "qwen3-fbda"
+          # NCCL WATCHDOG. Turns a wedged training step into a clear failure instead of a
+          # silent hang: if one rank dies or a network link stalls, the other ranks wait
+          # forever inside a collective op, every pod stays Running/Ready, and
+          # DCGM_FI_DEV_GPU_UTIL reads 100% for a rank stuck waiting — every signal says the
+          # run is healthy. These settings make the monitoring thread stop the process once
+          # the watchdog sees no progress and save a trace of the collective operation that
+          # was running and which ranks never arrived. See the Sensor's embedded RayJob
+          # template (base/20-events/s3-eventsource-sensor.yaml, search TORCH_NCCL) for the
+          # full explanation, including why 1200 seconds and why these stay in `env:` and not
+          # runtimeEnvYAML.
+          - name: TORCH_NCCL_ENABLE_MONITORING
+            value: "1"
+          - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+            value: "1200"
+          - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+            value: "1"
+          - name: TORCH_NCCL_TRACE_BUFFER_SIZE
+            value: "2000"
+          - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+            value: "3"
+          volumeMounts:
+          - name: fbda-shared
+            mountPath: /mnt/fbda
+          # NCCL's shared-memory transport needs real /dev/shm, not the container
+          # runtime's 64Mi default. 4Gi is not a tight floor here: a run of this
+          # pipeline at this size shows under 1% utilization (33M used of 4Gi) during
+          # real training — evidence of headroom, not a tight floor. Re-check this number if
+          # NCCL SHM usage ever looks tight. This must match the Sensor's embedded copy
+          # and the other RayJob manifests. There is no automated check for this anywhere
+          # in this repo — every one of the five manifests (rayjob-eval-v8.yaml,
+          # rayjob-train-ephemeral.yaml, rayjob-resume-v5.yaml, this file, and the
+          # Sensor's embedded copy in s3-eventsource-sensor.yaml) has to be kept in sync
+          # by hand, this one included.
+          - name: dev-shm
+            mountPath: /dev/shm
+        volumes:
+        - name: fbda-shared
+          persistentVolumeClaim:
+            claimName: fbda-shared
+        - name: dev-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

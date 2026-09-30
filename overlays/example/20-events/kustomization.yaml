@@ -1,0 +1,48 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# This is an example overlay. You copy this directory and edit it.
+# Phase 20-events namespaces belong to the product or the cluster, so this overlay sets no
+# namespace.
+
+resources:
+  - ../../../base/20-events
+
+# ---------------------------------------------------------------------------------------------
+# THE SENSOR CARRIES A WHOLE RayJob INSIDE IT. NO TRANSFORMER REACHES IN.
+#
+# `base/20-events/s3-eventsource-sensor.yaml` embeds the RayJob that a new S3 object triggers.
+# It is a literal template under `spec.triggers[].template.k8s.source.resource`. To Kubernetes
+# and to kustomize, this is only a field inside a Sensor, not a RayJob object. The namespace
+# transformer does not rewrite it. The image transformer does not rewrite it. A patch that
+# targets `kind: RayJob` does not match it, because there is no RayJob object here yet — only a
+# Sensor that creates one later.
+#
+# So every value you changed elsewhere has a second copy here that you must change by hand:
+#   - the namespace the triggered RayJob is created into, and its `queue-name` label
+#   - the GPU nodeSelector, in two places: head and worker (see overlays/example/40-workloads
+#     for why `nvidia.com/gpu.present` is the base default, and when to narrow it)
+#   - the container image
+#   - worker `replicas` and resource requests
+#
+# This is the most common way to get a deployment that applies cleanly but does not work. The
+# standing manifests are correct, but the triggered job is wrong. Nothing shows the difference
+# until an object lands in the bucket: the run then starts on the wrong nodes, or does not
+# start at all.
+#
+# Patch the Sensor itself, using the path inside the template:
+#
+# patches:
+#   - target: {group: argoproj.io, version: v1alpha1, kind: Sensor, name: s3-new-object}
+#     patch: |-
+#       - op: replace
+#         path: "/spec/triggers/0/template/k8s/source/resource/spec/rayClusterSpec/headGroupSpec/template/spec/nodeSelector"
+#         value: {nvidia.com/gpu.product: NVIDIA-H100-PCIe}
+#       - op: replace
+#         path: "/spec/triggers/0/template/k8s/source/resource/spec/rayClusterSpec/workerGroupSpecs/0/template/spec/nodeSelector"
+#         value: {nvidia.com/gpu.product: NVIDIA-H100-PCIe}
+#
+# Verify with `kubectl kustomize` and read the rendered Sensor before you apply it. Schema
+# validation does not cover a trigger template. From the CRD's point of view, it is just a
+# field.
+# ---------------------------------------------------------------------------------------------

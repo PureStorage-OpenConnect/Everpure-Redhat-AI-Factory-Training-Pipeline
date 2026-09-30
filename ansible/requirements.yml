@@ -1,0 +1,13 @@
+---
+# Collection requirements for flashblade-prepare.yml.
+#
+#   ansible-galaxy collection install -r requirements.yml
+#
+# NOTE THE NAMESPACE. The FlashBlade collection was published as `purestorage.flashblade` for
+# years and was RENAMED to `everpure.flashblade` at 1.27.0. The old namespace still installs and
+# still works, but it now contains redirects only, every module call emits a deprecation warning,
+# and the redirects are scheduled for removal at 2.0.0. Playbooks written from memory or copied
+# from older material will use the old name; this one does not.
+collections:
+  - name: everpure.flashblade
+    version: ">=1.27.0"

@@ -1,0 +1,65 @@
+# Create a CSI VolumeSnapshot of the RWX checkpoint volume (fbda-shared). This
+# proves the PX-CSI to FlashBlade filesystem-snapshot path, using a real DeepSpeed ZeRO-3
+# checkpoint.
+#
+# WHY px-csi-fbda-class USES RETAIN: a checkpoint snapshot must survive deletion of the
+# Kubernetes VolumeSnapshot object, so a later restore (V5) can still bind it. A Delete policy
+# would remove the FlashBlade filesystem snapshot while a restore is in progress: nothing links
+# `deletionPolicy` to whether a restore from that snapshot is currently in flight, so a delete
+# that races an in-progress restore can remove the backing filesystem snapshot out from under
+# it. Retain on the VolumeSnapshotContent is the only guard against that race.
+#
+# THIS IS NOT PART OF THE 30-pipeline APPLY. It is published, but you apply it by hand. See the
+# note in that phase's kustomization.yaml. If you snapshot at install time, you capture the
+# freshly provisioned, empty volume. The snapshot still binds in about 2 seconds and still
+# reports `readyToUse: true`, but the restore is an empty tree. Nothing in that sequence looks
+# wrong, so check the timing yourself.
+#
+# APPLY THIS ONLY WHEN THE CHECKPOINT IS ACTUALLY ON THE VOLUME. An automated run ends with:
+# save, verify, upload to S3, then `shutil.rmtree(ckpt_dir)`. By the time the RayJob reports
+# SUCCEEDED, there is nothing left to snapshot. Do one of the following:
+#   - snapshot mid-run, during the S3 upload window (this works, but you get one attempt)
+#   - set `KEEP_LOCAL_CKPT=1` on the training run, so the local copy survives, then apply this
+#     file later at your own pace
+# Verify with the commands below and confirm the restore is not empty before you trust it.
+#
+# Apply: oc -n ml-training apply -f volumesnapshot-ckpt.yaml
+#
+# WARNING: the `-n` flag is required. If you omit it, the command fails with no error message.
+# This manifest sets no `metadata.namespace`; the Kustomize overlay sets it. A bare
+# `oc apply -f` creates the VolumeSnapshot in your current context's namespace, where its
+# source PVC does not exist. It stays not-ready, and the reason is buried in the snapshot
+# controller's log. See base/40-workloads/rayjob-eval-v8.yaml for related detail.
+# Use `make apply-phase OVERLAY=overlays/<yours> PHASE=30-pipeline` instead. It cannot
+# get this wrong.
+#
+# Verify:
+#   - oc -n ml-training get volumesnapshot fbda-ckpt-v9 -o jsonpath='{.status.readyToUse}'
+#     (expect: true — observed ready in about 2 seconds)
+#   - The Kubernetes snapshotContent name suffix matches the FlashBlade file-system-snapshot
+#     suffix:
+#       oc get volumesnapshotcontent \
+#         $(oc -n ml-training get volumesnapshot fbda-ckpt-v9 -o jsonpath='{.status.boundVolumeSnapshotContentName}') \
+#         -o jsonpath='{.status.snapshotHandle}'
+#     (expect: a snapshot-handle UUID)
+#   - On the FlashBlade side (Purity//FB REST /api/<ver>/file-system-snapshots), a snapshot
+#     named `px_<fs>-<pvc>.snapshot-<content-uid>` appears on the source FBDA filesystem.
+#
+# `fbda-shared` holds one run's checkpoint at `/mnt/fbda/ckpt-<run-id>/global_step<N>` (16
+# ZeRO-3 rank shards). This snapshot is linked back to the run through the MLflow tag
+# `volume_snapshot_id` on the `qwen3-fbda` experiment.
+#
+# `run-id: example-run` below is a placeholder label for lineage. Set it to the real
+# RayCluster name (the value RUN_ID is populated from — see s3-eventsource-sensor.yaml) of the
+# run whose checkpoint you are snapshotting.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: fbda-ckpt-v9
+  labels:
+    app: fbda-checkpoint
+    run-id: example-run
+spec:
+  volumeSnapshotClassName: px-csi-fbda-class
+  source:
+    persistentVolumeClaimName: fbda-shared

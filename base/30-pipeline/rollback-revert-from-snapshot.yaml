@@ -1,0 +1,61 @@
+# THIS IS THE ONLY DESTRUCTIVE FILE IN THIS REPOSITORY. IT IS NOT IN ANY `resources:` LIST.
+# READ THIS BEFORE YOU APPLY IT.
+#
+# This PVC does not copy the checkpoint volume. IT REVERTS IT. A PVC created from a
+# VolumeSnapshot of `fbda-shared` shares the SAME `volumeHandle` as the source. There is no
+# second filesystem at any point (see Contract §3.3). Creating this PVC
+# rolls `fbda-shared` back to the snapshot and DELETES EVERY WRITE MADE SINCE THE SNAPSHOT, on
+# the whole filesystem, not just the checkpoint directory. Before you apply this:
+#   - read docs/rollback-runbook.md
+#   - read ENVIRONMENT-CONTRACT.md §3.3 for the measurement and the three-tier recovery table
+#
+# WHY THIS FILE SHIPS BUT NOTHING APPLIES IT AUTOMATICALLY. `apply -k` on phase 30 must never
+# revert a volume as a side effect of a routine install or reinstall. The same rule applies to
+# volumesnapshot-ckpt.yaml, one directory over: kept in the tree, kept out of every `resources:`
+# list, and explained in the phase's kustomization.yaml and in its own header. This file follows
+# the same rule, because a revert is a bigger hazard than a snapshot.
+#
+# THE FILE NAME IS DELIBERATELY NOT `pvc-*.yaml`. `base/30-pipeline/` ships exactly one
+# `pvc-*.yaml` file (pvc-fbda-shared.yaml). Three file headers in this directory tell you to run
+# a literal `oc apply -f <file>`. A `pvc-`-prefixed destructive file would match a harmless
+# neighbor under `oc apply -f pvc-*.yaml`. This file name cannot match that pattern.
+#
+# APPLY THIS AS THREE SEPARATE STEPS, NEVER ONE. (base/40-workloads/rayjob-resume-v5.yaml
+# records the same rule for the resume side.)
+#   1. Apply this file, and wait for the PVC to report `Bound`.
+#   2. Confirm the reverted content is what you intended.
+#   3. Only then apply a resume job against it.
+# Never combine a revert with a Job's own startup. A Job that reverts a live volume as a side
+# effect of starting can waste a GPU cycle (see base/40-workloads/rayjob-resume-v5.yaml).
+#
+# Apply, always with `-n` (see pvc-fbda-shared.yaml's header for what a bare `apply -f` does):
+#   oc -n ml-training apply -f rollback-revert-from-snapshot.yaml
+#   oc -n ml-training get pvc fbda-shared-rollback   # expect: Bound — then STOP and check contents
+#
+# BEFORE YOU TRUST THE REVERT, CONFIRM IT HAPPENED. Check a file or a modified time that you
+# know should be gone.
+#
+# `fbda-ckpt-v9` is the VolumeSnapshot that volumesnapshot-ckpt.yaml creates (opt-in, applied by
+# hand — see that file). If you snapshot under a different name, change `spec.dataSource.name`
+# to match.
+#
+# Deleting this PVC afterward is safe only because the source StorageClass is `Retain`. No array
+# call happens on delete. See base/10-storage/storageclass-snapclass-px-csi.yaml for why `Retain`
+# is required here.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fbda-shared-rollback
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: px-fb-direct-access-nfsv4-retain
+  dataSource:
+    name: fbda-ckpt-v9
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  resources:
+    requests:
+      storage: 800Gi

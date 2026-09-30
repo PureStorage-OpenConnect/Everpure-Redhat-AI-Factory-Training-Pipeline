@@ -1,0 +1,153 @@
+# DCGM exporter counter set. Adds three signals that show TRAINING apart from WEDGED.
+#
+# THE MAIN POINT: DCGM_FI_DEV_GPU_UTIL answers only "was any kernel resident in this sample
+# window?". It reads 100% for a rank that is stuck in an NCCL wait. It cannot tell a healthy
+# 8-GPU run from a full collective hang. It is the only GPU signal this exporter collects by
+# default, and it is ambiguous in the one direction that matters most.
+#
+# Do not trust GPU_UTIL alone. The DCGM dashboard can show a healthy run while Ray logs
+# `infeasible resource requests` for an extended period, and GPU_UTIL would show 100% during a
+# real hang too.
+#
+# This file adds three fields:
+#
+#   - DCGM_FI_PROF_SM_ACTIVE
+#     Shows the ratio of cycles where an SM has at least one warp assigned. This is real GPU
+#     work, not only residency. SM_ACTIVE close to zero while the pod is Running and GPU_UTIL is
+#     100% is the sign of a silent hang. It is the only field here that tells work apart from
+#     waiting. The default exporter does not collect it.
+#
+#   - DCGM_FI_DEV_ECC_DBE_VOL_TOTAL
+#     Counts double-bit (uncorrectable) volatile ECC errors. A double-bit error poisons the
+#     memory page and kills the process. On an 8-way job, this can end a 2-hour run with a CUDA
+#     stack trace that does not point at the failed memory. The default exporter collects only
+#     the remap counters, which record the aftermath, not the ECC event itself.
+#
+#   - DCGM_FI_DEV_CLOCKS_EVENT_REASONS
+#     Shows a bitmask of why the clock speed changed: thermal cap, power cap, hardware slowdown,
+#     or sync boost. This shows the difference between "the run got 20% slower" and "the run got
+#     20% slower because the card is thermally capped."
+#     Note: DCGM renamed this field from DCGM_FI_DEV_CLOCK_THROTTLE_REASONS. On an older
+#     exporter, the new name does not cause an error. The exporter silently drops the unknown
+#     field, and the metric never appears. Check the metrics endpoint after you apply this file.
+#     Do not trust a Ready DaemonSet alone.
+#
+# NOT ADDED, on purpose: NVLink and MIG fields.
+# These nodes use NVIDIA L40S GPUs. The L40S has no NVLink and no MIG. An NVLink or MIG field on
+# this hardware reports a flat zero forever. A flat-zero panel does not read as "not applicable."
+# It reads as "no traffic," which is the wrong signal to show during a real hang. Do not add
+# NVLink panels for GPUs without NVLink.
+#
+# WARNING: this file REPLACES the built-in counter set. It does not add to it.
+# dcgm-exporter reads exactly one collectors file. Once this ConfigMap is in use, the exporter
+# stops reading its built-in list. Any field missing from this file STOPS BEING COLLECTED, with
+# no error message — only an empty panel on a dashboard. The list below is the exporter's default
+# set plus the three additions above. Four of these fields are load-bearing for
+# dcgm-console-dashboard.yaml, which plots only these four: DCGM_FI_DEV_GPU_UTIL,
+# DCGM_FI_DEV_FB_USED, DCGM_FI_DEV_POWER_USAGE, DCGM_FI_DEV_GPU_TEMP. Removing one of these four
+# silently blanks its panel.
+#
+# DCGM_FI_DRIVER_VERSION is a label, not a metric. It is why every DCGM series carries a
+# DCGM_FI_DRIVER_VERSION label today. Remove this line and the label disappears from every
+# series. This breaks any query or dashboard that groups by driver version.
+#
+# WIRING: this ConfigMap does nothing until the ClusterPolicy points at it.
+# The GPU Operator mounts a counters ConfigMap only when spec.dcgmExporter.config.name names it.
+# It does not read the collectors path from the mount; you must also set the env var. Applying
+# this file alone changes nothing: it applies without error and collects no new metric.
+#
+# To turn this file on, patch the GPU Operator's ClusterPolicy. Installing the GPU Operator is a
+# separate prerequisite (see ENVIRONMENT-CONTRACT.md §2):
+#
+#   spec:
+#     dcgmExporter:
+#       config:
+#         name: dcgm-exporter-counters
+#       env:
+#         - name: DCGM_EXPORTER_COLLECTORS
+#           value: /etc/dcgm-exporter/dcgm-metrics.csv
+#
+# The key name below and this path must match exactly. No check enforces this.
+#
+# Editing the ClusterPolicy restarts the dcgm-exporter DaemonSet. This causes a short gap in GPU
+# metrics, but it does not affect running workloads. Do not do this during a run if you need that
+# run's GPU trace as evidence.
+#
+# Verify (a Ready DaemonSet does not prove the field is collected):
+#   oc -n nvidia-gpu-operator get ds nvidia-dcgm-exporter \
+#     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DCGM_EXPORTER_COLLECTORS")].value}'
+#   # then, from any pod that can reach the service:
+#   wget -qO- http://nvidia-dcgm-exporter.nvidia-gpu-operator.svc:9400/metrics | grep -c DCGM_FI_PROF_SM_ACTIVE
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dcgm-exporter-counters
+  namespace: nvidia-gpu-operator
+data:
+  # Format: <DCGM field>, <prometheus metric type>, <help text>. A line that starts with '#' is a comment.
+  dcgm-metrics.csv: |
+    # Clocks
+    DCGM_FI_DEV_SM_CLOCK,  gauge, SM clock frequency (in MHz).
+    DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock frequency (in MHz).
+
+    # Temperature
+    DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (in C).
+    DCGM_FI_DEV_GPU_TEMP,    gauge, GPU temperature (in C).
+
+    # Power
+    DCGM_FI_DEV_POWER_USAGE,              gauge,   Power draw (in W).
+    DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption since boot (in mJ).
+
+    # Utilization. The exporter samples this over a time window. It shows residency, not real
+    # work — see the file header.
+    DCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (in %).
+    DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %).
+    DCGM_FI_DEV_ENC_UTIL,      gauge, Encoder utilization (in %).
+    DCGM_FI_DEV_DEC_UTIL,      gauge, Decoder utilization (in %).
+
+    # Memory usage
+    DCGM_FI_DEV_FB_FREE,     gauge, Framebuffer memory free (in MiB).
+    DCGM_FI_DEV_FB_USED,     gauge, Framebuffer memory used (in MiB).
+    DCGM_FI_DEV_FB_RESERVED, gauge, Framebuffer memory reserved (in MiB).
+
+    # PCIe
+    DCGM_FI_DEV_PCIE_REPLAY_COUNTER, counter, Total number of PCIe retries.
+
+    # Remapped rows. These show what happened AFTER an ECC event. The DBE counter below records
+    # the event itself, so this file adds it and keeps these rows too.
+    DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS, counter, Number of remapped rows for uncorrectable errors.
+    DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS,   counter, Number of remapped rows for correctable errors.
+    DCGM_FI_DEV_ROW_REMAP_FAILURE,           gauge,   Whether remapping of rows has failed.
+
+    # vGPU
+    DCGM_FI_DEV_VGPU_LICENSE_STATUS, gauge, vGPU License status.
+
+    # Profiling (DCP). Present in the shipped set already.
+    DCGM_FI_PROF_GR_ENGINE_ACTIVE,   gauge, Ratio of time the graphics engine is active.
+    DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, gauge, Ratio of cycles the tensor (HMMA) pipe is active.
+    DCGM_FI_PROF_DRAM_ACTIVE,        gauge, Ratio of cycles the device memory interface is active.
+    DCGM_FI_PROF_PCIE_TX_BYTES,      gauge, Bytes transmitted through PCIe TX.
+    DCGM_FI_PROF_PCIE_RX_BYTES,      gauge, Bytes received through PCIe RX.
+
+    # --- ADDED for training observability -----------------------------------------------------
+    # SM_ACTIVE answers "is the GPU computing?". GPU_UTIL only answers "is a kernel resident?".
+    # A rank stuck in an NCCL wait keeps a kernel resident with no time limit.
+    DCGM_FI_PROF_SM_ACTIVE, gauge, Ratio of cycles an SM has at least one warp assigned.
+    # Uncorrectable ECC. This is the event that kills the process. The remap counters above
+    # record only what the driver did about it afterward.
+    DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Total number of double-bit volatile ECC errors.
+    # Shows why the clock speed changed: thermal cap, power cap, hardware slowdown, or sync
+    # boost. Gives a clear cause for duration drift that would otherwise look unexplained.
+    DCGM_FI_DEV_CLOCKS_EVENT_REASONS, gauge, Bitmask of active clock event (throttle) reasons.
+
+    # NOT ADDED, on purpose:
+    #   - DCGM_FI_DEV_NVLINK_* and DCGM_FI_PROF_NVLINK_*: the L40S has no NVLink. These fields
+    #     would show a flat zero and mislead.
+    #   - Any MIG field: nvidia.com/mig.capable=false on these nodes.
+    #   - DCGM_FI_DEV_XID_ERRORS: not in this exporter's default set either. Add it if you see
+    #     driver-level faults. Left out here to keep this file a small, reviewable change from
+    #     what the cluster collects today.
+
+    # This is a label on every series above, not a metric of its own.
+    # Removing this line removes the label from every series — see the warning in the file header.
+    DCGM_FI_DRIVER_VERSION, label, Driver Version.

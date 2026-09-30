@@ -1,0 +1,80 @@
+# Service and ServiceMonitor for Argo Events sensors (port 7777).
+#
+# The sensor pod has always listened on a container port named `metrics`. No Service exists in
+# front of it, so nothing has ever scraped this endpoint. This file adds both the Service and
+# the ServiceMonitor.
+#
+# THE SELECTOR USES `controller: sensor-controller`, NOT A SENSOR NAME. The Argo Events
+# controller adds this label, plus `sensor-name=<name>`, to every sensor Deployment it
+# creates. A selector on the sensor name would tie this file to one Sensor object
+# in base/20-events. If you rename that Sensor, the Service then selects nothing, which looks
+# like a sensor that has not fired. The controller label selects every sensor in the namespace,
+# including sensors added later.
+#
+# THE NAMESPACE IS SET BY NAME, NOT BY THE OVERLAY. Under user-workload monitoring (UWM), a
+# ServiceMonitor scrapes targets only in its own namespace; UWM ignores `namespaceSelector`. So
+# both objects live in the `argo-events` namespace. Phase 00-platform runs no namespace
+# transformer, so product-owned namespaces are set here directly — the same reason the DCGM
+# dashboard names `openshift-config-managed` directly.
+#
+# EXPECT A NEARLY EMPTY TARGET. THIS IS NOT AN ERROR.
+#   - The sensor endpoint serves only `build_info` and the go_*/process_* runtime metrics
+#     until the sensor fires.
+#   - Argo Events creates its action counters only after the sensor fires at least once. Until
+#     then, `argo_events_action_triggered`, `_action_failed`, `_action_retries_failed`, and
+#     `_action_duration` do not exist as metrics.
+#   - A new sensor and a sensor that never fires again look the same on this endpoint.
+#
+# A HARDER LIMIT THIS FILE DOES NOT FIX: Argo Events has no counter for events received, events
+# filtered, or dependency conditions left unmet. The filter-rejection log line is DEBUG level, so
+# at the default log level a mismatch produces no output. A trigger parameter that names an
+# undeclared dependency is skipped with no warning, and the trigger still reports SUCCESS. No
+# metric on this endpoint can show that failure. Only a synthetic canary tests the full chain.
+# Scrape this endpoint because `action_failed` and `action_duration` are useful once they exist,
+# not because scraping alone closes that gap.
+#
+# Verify:
+#   - oc -n argo-events get endpoints argo-events-sensor-metrics (expect one address per sensor pod)
+#   - Console -> Observe -> Targets, filter `sensor` -> should show UP
+apiVersion: v1
+kind: Service
+metadata:
+  name: argo-events-sensor-metrics
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  # This Service is headless on purpose. It exists only so Prometheus can find an Endpoints
+  # object. Do not route traffic through it. A ClusterIP would allow that.
+  clusterIP: None
+  selector:
+    controller: sensor-controller
+  ports:
+    # targetPort uses the container port name, not the number. This value still works if a
+    # future Argo Events release changes the port number. The sensor controller sets the name
+    # `metrics`.
+    - name: metrics
+      port: 7777
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: argo-events-sensor-metrics
+  namespace: argo-events
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  # A ServiceMonitor selects a Service only by label. There is no way to select by name. This
+  # selector matches the Service above, the only object in `argo-events` with this label. If you
+  # add another fbda-observability Service to this namespace, this monitor scrapes it too. Give
+  # the new Service a different label instead.
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: fbda-observability
+  endpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+      interval: 30s

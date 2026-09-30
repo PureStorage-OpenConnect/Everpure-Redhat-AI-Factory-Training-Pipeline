@@ -1,0 +1,55 @@
+# ServiceMonitor for the Portworx CSI controller and node plugins (port 9091).
+#
+# Both metrics Services are unscraped by default, because the `portworx` namespace does not
+# have the label `openshift.io/cluster-monitoring=true`.
+#
+# ONE SERVICEMONITOR COVERS TWO SERVICES, ON PURPOSE.
+#   - `pure-csi-controller-metrics` and `pure-csi-node-metrics` carry identical labels and both
+#     name their port `metrics`.
+#   - Two ServiceMonitors with a label selector would each match both Services. Every target
+#     would then be scraped twice: duplicate series, doubled sample cost, and a rate() over a
+#     doubled counter that still looks correct.
+#   - One selector matching both Services is correct, because it matches what the labels say.
+#   - To tell the two apart in queries, use the `service` label that prometheus-operator adds
+#     (for example `{service="pure-csi-node-metrics"}`). Do not add a second ServiceMonitor.
+#
+# THIS SERVICEMONITOR DOES NOTHING UNTIL UWM IS ON. See cluster-monitoring-config.yaml. The
+# `portworx` namespace also has an unscraped `portworx-operator-metrics` ServiceMonitor for the
+# operator on port 8999. Enabling UWM starts that one too, at no extra cost and with no change
+# needed here.
+#
+# WHAT THESE ENDPOINTS SERVE. READ THIS BEFORE YOU WRITE AN ALERT.
+#   - These endpoints serve:
+#       controller: px_csi_fafb_all_apis_requests_total, px_csi_fafb_apis_array_requests_total
+#       node: px_csi_attachments_per_node, px_csi_nodestagevolume_latency_ms,
+#             px_csi_nodepublishvolume_latency_ms, px_csi_nodeunstagevolume_latency_ms,
+#             px_csi_nodeunpublishvolume_latency_ms
+#   - The node-side latencies are the main reason to use this file. A hung NFS operation has no
+#     timeout. NCCL watchdogs do not catch it, and nothing else does either. It can hang for
+#     hours with no alert. A rising `px_csi_nodestagevolume_latency_ms` is one of the few signs
+#     that turns this condition into a number instead of a stuck pod nobody notices.
+#   - What is missing: no capacity or usage metrics. `px_volume_fs_usage_bytes` and
+#     `px_volume_capacity_bytes` (documented from PX 26.1.0) do not appear on either endpoint on
+#     this cluster. For volume headroom (for example, a 366 GiB / ~393 GB checkpoint against an 800 GiB
+#     volume), use `kubelet_volume_stats_available_bytes` instead. Note that those metrics exist
+#     only while a pod mounts the PVC, and disappear between runs.
+#
+# Verify: Console -> Observe -> Targets, filter `pure-csi` -> controller plus one target per
+# node, all UP
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: portworx-csi-metrics
+  namespace: portworx
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pure-csi-driver
+      app.kubernetes.io/part-of: pxd.portworx.com
+  endpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+      interval: 30s

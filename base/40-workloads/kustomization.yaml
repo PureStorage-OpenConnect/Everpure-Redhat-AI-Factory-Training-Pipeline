@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Phase 40 — opt-in GPU workloads. The standard sequence does not apply this phase.
+#
+# Everything here uses GPU quota as soon as you apply it: one standing RayCluster (4
+# workers) and three run-specific RayJobs, kept as worked examples of resume and eval
+# submissions. The autonomous pipeline does not need them. Its RayJobs come from the
+# Sensor in base/20-events when an S3 object arrives.
+#
+# WARNING: worker counts differ between these files on purpose. The two jobs that
+# load a checkpoint, rayjob-eval-v8.yaml and rayjob-resume-v5.yaml, run 8 workers.
+# The two that do not, raycluster-fbda-checkpoint.yaml and rayjob-train-ephemeral.yaml,
+# run 4 workers.
+#
+# A DeepSpeed ZeRO-3 checkpoint is split by rank. A job that loads one must use the
+# same world size that saved it: 8, the Sensor's NUM_WORKERS value. See
+# rayjob-eval-v8.yaml's header for the full detail and what to change if your
+# pipeline trains at a different width. 8 workers is the ClusterQueue's entire GPU
+# quota, so a loader job and a training run cannot run at the same time.
+#
+# Apply these files by hand, one at a time. Never apply this as a phase.
+
+resources:
+  - raycluster-fbda-checkpoint.yaml
+  - rayjob-eval-v8.yaml
+  - rayjob-resume-v5.yaml
+  - rayjob-train-ephemeral.yaml

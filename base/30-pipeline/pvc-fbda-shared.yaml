@@ -1,0 +1,31 @@
+# This is a standalone PVC manifest for fbda-shared.
+#
+# Apply this file first, so the PVC exists before any pipeline manifest needs it.
+# Every workload manifest that mounts this volume references claimName: fbda-shared.
+#
+# Apply this after PX-CSI storage is up (StorageCluster Running, StorageClass present):
+#   oc -n ml-training apply -f pvc-fbda-shared.yaml
+#   oc -n ml-training get pvc fbda-shared   # expect: Bound
+#
+# WARNING: the `-n` flag is not optional. Without it, the command fails silently. This
+# manifest sets no `metadata.namespace`; the Kustomize overlay sets it. A bare
+# `oc apply -f` creates the PVC in your current context's namespace instead, and every
+# manifest that references `claimName: fbda-shared` in ml-training finds nothing. Use
+# `make apply-phase OVERLAY=overlays/<yours> PHASE=30-pipeline` instead; it sets the
+# namespace correctly.
+#
+# Size: 800Gi. This covers a 393 GB ZeRO-3 checkpoint (8 ranks, 49 GB optimizer shards
+# each) plus one retained FlashBlade snapshot copy of a prior run.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fbda-shared
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: px-fb-direct-access-nfsv4-retain
+  resources:
+    requests:
+      storage: 800Gi

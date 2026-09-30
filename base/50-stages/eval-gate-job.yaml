@@ -1,0 +1,218 @@
+# This is the gate half: the hard eval-gate decision, as a control-flow step that
+# needs no GPU. It reads the eval-report.json file that ../40-workloads/rayjob-eval-v8.yaml
+# writes.
+#   - If perplexity is at or below the threshold, it PROMOTES: register is allowed (V9).
+#   - If perplexity is above the threshold, it STOPS and ALERTS: no register.
+# Keeping this decision in a GPU-free Job is on purpose. You can prove the FAIL branch by
+# re-running this step with a tighter threshold; no GPU re-run is needed. This matches the
+# pipeline's train -> eval-gate -> register hand-off.
+#
+# The two Jobs below show both branches:
+#   - eval-gate-pass: loose threshold -> the real perplexity passes -> PROMOTE (exit 0)
+#   - eval-gate-fail: tight threshold -> the same real perplexity fails -> ALERT and STOP (exit 1)
+# The FAIL is a real threshold breach on the actual measured metric, not a fake result. The
+# design forces a fail on purpose, to prove the branch works. Resume-on-fail is handled
+# separately (see ../40-workloads/rayjob-resume-v5.yaml): on a gate FAIL, the
+# pipeline resumes from the last good snapshot instead of losing the run.
+#
+# THERE IS A THIRD OUTCOME, AND IT IS NOT A FAILURE. Exit 2 means INCONCLUSIVE: the report
+# describes an eval that never loaded a checkpoint, so there is no decision to make. See the
+# comment on the check itself for why this differs from exit 1. Without this check, a
+# report with `global_step: 0` and an empty `resume_from` — holding a base-model perplexity —
+# would be gated as if it were a trained model. The three malformed report shapes exit with
+# code 2, and a real report still exits 0 at a loose bar and 1 at a tight bar.
+#
+# The thresholds below sit on either side of the measured perplexity. A run measured 1.9910
+# (mean_loss 0.6886, global_step 15, n=64 held-out, world_size 8); an earlier run of the same
+# shape measured 2.0032. Both values sit inside
+# 1.5 < ppl < 2.5, so the bars stay the same, and both branches are shown correctly with either
+# number: the PASS bar of 2.5 promotes, and the FAIL bar of 1.5 alerts.
+#
+# `snapshot=` IN THIS SCRIPT'S OUTPUT IS A LABEL, NOT PROOF OF ORIGIN. It prints the report's
+# `volume_snapshot_id` field. The eval job supplies this as free text (VOLUME_SNAPSHOT_ID),
+# and nothing checks that it is correct. The eval reads the live volume through
+# RESUME_FROM; this field can independently say `fbda-ckpt-v9` even when the eval never
+# touched that snapshot. So the output line can read
+# "snapshot=fbda-ckpt-v9" for an eval that never touched a snapshot. Do not gate on this
+# field, and do not cite it as the data's origin. `resume_from` is the field that says where
+# the weights came from, and it is the field the INCONCLUSIVE check below tests. See the note
+# on VOLUME_SNAPSHOT_ID in ../40-workloads/rayjob-eval-v8.yaml.
+#
+# First produce the eval report (../40-workloads/rayjob-eval-v8.yaml), then run:
+#   oc -n ml-training apply -f eval-gate-job.yaml
+#   oc -n ml-training wait --for=condition=complete job/eval-gate-pass --timeout=120s   # PASS -> exit 0
+#   oc -n ml-training get job eval-gate-fail   # FAIL -> not complete, pod exits 1 (see logs for ALERT)
+#
+# THE `-n` FLAG IS NOT OPTIONAL IN THE COMMANDS ABOVE. LEAVING IT OUT FAILS SILENTLY. These
+# manifests declare no `metadata.namespace` on purpose, because the Kustomize overlay sets it
+# (`overlays/example/*/kustomization.yaml` sets `namespace:`). A bare `oc apply -f` puts the
+# object into whatever namespace your current context points at instead. Kueue finds no
+# LocalQueue there and suspends the job. `oc apply` reports the object as created,
+# `oc -n <expected-ns> get rayjob` shows nothing, and nothing tells you why. Prefer
+# `make apply-phase OVERLAY=overlays/<yours> PHASE=<phase>` instead, which goes through the
+# overlay and cannot make this mistake.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eval-gate-code
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+data:
+  gate.py: |
+    import json
+    import os
+    import sys
+
+    report_path = os.environ["EVAL_REPORT_PATH"]
+    threshold = float(os.environ["EVAL_THRESHOLD_PPL"])
+    with open(report_path) as f:
+        r = json.load(f)
+    ppl = float(r["perplexity"])
+    run = r.get("run_id")
+    step = r.get("global_step")
+    snap = r.get("volume_snapshot_id")
+    print(f"[eval-gate] report={report_path} run={run} global_step={step} snapshot={snap}", flush=True)
+
+    # REFUSE TO DECIDE ON AN EVAL THAT NEVER LOADED A CHECKPOINT.
+    #
+    # THE DEFECT THIS CHECK EXISTS FOR. EVAL_ONLY with RESUME_FROM unset is not an error
+    # anywhere in the eval path. The training code's resume step is simply skipped, the
+    # forward pass runs against the pretrained base model, and a believable perplexity value
+    # is written to the report. Reading only `perplexity` would PROMOTE a model that was never
+    # trained. The report always shows the true cause — `global_step: 0` and an empty
+    # `resume_from` — and the checks below are what look for it.
+    #
+    # EXIT 2, NOT 1. Exit 1 means "the model was evaluated and missed the bar." A pipeline
+    # may correctly answer exit 1 by resuming from the last good snapshot. Exit 2 means
+    # something different: this number does not describe the checkpoint anyone meant to
+    # gate, so there is no decision to make. Exit 2 is INCONCLUSIVE, not a pass. This matches
+    # the convention a release gate uses: a gate that cannot decide must not report a pass.
+    #
+    # Both fields are required, not either one. `resume_from` says a checkpoint was
+    # requested. `global_step` says one was actually restored. A report missing either field
+    # was produced by something other than a resumed eval. Treat a missing key the same as
+    # an empty one.
+    resume_from = str(r.get("resume_from", "")).strip()
+    if not resume_from:
+        print(
+            f"[eval-gate][INCONCLUSIVE] report={report_path} has no resume_from: this eval loaded no "
+            f"checkpoint, so perplexity {ppl:.4f} describes the base model, not a trained one. "
+            f"Set RESUME_FROM on the eval RayJob and re-run it. NOT a gate failure — no decision made.",
+            flush=True,
+        )
+        sys.exit(2)
+    if not step:
+        print(
+            f"[eval-gate][INCONCLUSIVE] report={report_path} has global_step={step!r} with "
+            f"resume_from={resume_from!r}: nothing was restored, so perplexity {ppl:.4f} does not "
+            f"describe the checkpoint. Check the eval job's load_checkpoint output. No decision made.",
+            flush=True,
+        )
+        sys.exit(2)
+
+    print(f"[eval-gate] perplexity={ppl:.4f} threshold={threshold:.4f}", flush=True)
+    if ppl <= threshold:
+        print(f"[eval-gate] PASS: perplexity {ppl:.4f} <= threshold {threshold:.4f} -> PROMOTE (register allowed)", flush=True)
+        marker = os.environ.get("PROMOTE_MARKER_PATH", "")
+        if marker:
+            with open(marker, "w") as m:
+                json.dump({"decision": "promote", "perplexity": ppl, "threshold": threshold, **r}, m, indent=2)
+            print(f"[eval-gate] wrote promote marker {marker}", flush=True)
+        sys.exit(0)
+    print(f"[eval-gate] FAIL: perplexity {ppl:.4f} > threshold {threshold:.4f} -> STOP pipeline, NO register", flush=True)
+    print(
+        f"[eval-gate][ALERT] run={run} global_step={step} snapshot={snap} failed eval gate "
+        f"(ppl {ppl:.4f} > {threshold:.4f}); resume-from-last-good-snapshot recommended",
+        flush=True,
+    )
+    sys.exit(1)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-gate-pass
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        # This Job mounts the checkpoint volume only to read one small JSON file. But the
+        # mount still costs whatever a full chown of the volume costs. See
+        # ../20-events/s3-eventsource-sensor.yaml for detail. A gate that
+        # cannot mount the volume stalls the pipeline right after a successful eval, which is
+        # the worst place for it to stall.
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: gate
+          image: registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
+          command: ["python3", "/gate/gate.py"]
+          env:
+            - name: EVAL_REPORT_PATH
+              value: /mnt/fbda/eval-report-v8.json
+            - name: EVAL_THRESHOLD_PPL
+              value: "2.5"   # promotion bar >= measured ppl 1.9910 -> PASS (a full pipeline sets this from a baseline-model eval; example-cluster delta: fixed bar)
+            - name: PROMOTE_MARKER_PATH
+              value: /mnt/fbda/promote-v8.json
+          volumeMounts:
+            - name: fbda-shared
+              mountPath: /mnt/fbda
+            - name: gate-code
+              mountPath: /gate
+      volumes:
+        - name: fbda-shared
+          persistentVolumeClaim:
+            claimName: fbda-shared
+        - name: gate-code
+          configMap:
+            name: eval-gate-code
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-gate-fail
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+    # This Job is DESIGNED to exit 1 (see the file header — it exists to prove the FAIL branch
+    # against the real measured perplexity). kube_job_status_failed cannot tell a designed
+    # failure from a real one, so FbdaJobFailed in pipeline-alerts-prometheusrule.yaml excludes
+    # this Job by name (job_name!="eval-gate-fail") instead of firing on it forever. This label
+    # is the human/tooling-visible marker for the same fact; keep its value in sync with that
+    # exclusion if this Job is ever renamed.
+    app.kubernetes.io/component: intentional-failure-gate
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: ckpt-training-pipeline
+        app.kubernetes.io/component: intentional-failure-gate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        # Same reason as the eval-gate-pass Job above.
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: gate
+          image: registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
+          command: ["python3", "/gate/gate.py"]
+          env:
+            - name: EVAL_REPORT_PATH
+              value: /mnt/fbda/eval-report-v8.json
+            - name: EVAL_THRESHOLD_PPL
+              value: "1.5"   # tight bar < measured ppl 1.9910 -> forces the injected FAIL (genuine threshold breach on the real metric)
+          volumeMounts:
+            - name: fbda-shared
+              mountPath: /mnt/fbda
+            - name: gate-code
+              mountPath: /gate
+      volumes:
+        - name: fbda-shared
+          persistentVolumeClaim:
+            claimName: fbda-shared
+        - name: gate-code
+          configMap:
+            name: eval-gate-code

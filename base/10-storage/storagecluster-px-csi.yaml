@@ -1,0 +1,48 @@
+# Standalone PX-CSI ("Portworx CSI") StorageCluster.
+#
+# This replaces the Enterprise data-plane StorageCluster. It deploys the separately
+# released Portworx CSI product, through the same operator, and this product can
+# snapshot FBDA pure_file volumes.
+#
+# Deploy facts:
+#   - The image is portworx/px-pure-csi-driver, not oci-monitor.
+#   - The annotation portworx.io/misc-args: "--oem px-csi" selects the CSI FA/FB
+#     build and license.
+#   - This StorageCluster sets no kvdb, storage, nodes, or stork field. PX-CSI keeps
+#     its metadata in Kubernetes custom resources, so it needs no KVDB, no local
+#     storage pool, and no oci-monitor data plane. A Controller Deployment and a node
+#     DaemonSet do the work.
+#   - This StorageCluster registers CSIDriver pxd.portworx.com in namespace portworx,
+#     using secret px-pure-secret. These match the existing FBDA setup, so
+#     storageclass-pure-file.yaml works unchanged.
+#
+# WARNING: licensing. The `--oem px-csi` setting selects a build whose FlashArray and
+# FlashBlade CSI license is built into the product. If provisioning or snapshot
+# operations fail and mention a license, that is a licensing problem, not a manifest
+# defect. Confirm your entitlement covers this OEM build. See
+# ENVIRONMENT-CONTRACT.md section 12.8.
+apiVersion: core.libopenstorage.org/v1
+kind: StorageCluster
+metadata:
+  name: px-csi-example
+  namespace: portworx
+  annotations:
+    portworx.io/is-openshift: "true"
+    portworx.io/misc-args: "--oem px-csi"
+    # This repository ships its own pure_file StorageClass (storageclass-pure-file.yaml).
+    # Do not let the operator create default StorageClasses.
+    portworx.io/disable-storage-class: "true"
+spec:
+  image: portworx/px-pure-csi-driver:26.2.0
+  imagePullPolicy: Always
+
+  # This setting removes all components cleanly on delete. No node wipe is needed,
+  # because PX-CSI has no storage pool.
+  deleteStrategy:
+    type: Uninstall
+
+  csi:
+    enabled: true
+    # OpenShift already ships its own cluster snapshot-controller. Do not install a
+    # second one, because two controllers must not reconcile the same VolumeSnapshots.
+    installSnapshotController: false

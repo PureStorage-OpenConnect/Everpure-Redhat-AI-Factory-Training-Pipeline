@@ -1,0 +1,23 @@
+# This is the Argo Events EventBus for the checkpoint-training trigger loop. It uses
+# native NATS (JetStream/STAN) with token authentication, installed into the
+# argo-events namespace alongside the Argo Events controller. This is the message
+# bus that the S3-poll EventSource publishes to, and the Sensor subscribes from.
+#
+# NOTE: the upstream Argo Events controller Deployment (installed by the Argo Events
+# operator, not part of this manifest tree) sets securityContext.runAsUser: 9731 by
+# default, which is outside the OpenShift-assigned UID range for this namespace and
+# makes the controller pod fail to start under restricted-v2. Before installing the
+# operator, patch that field out of the controller Deployment so OCP assigns an
+# in-range UID instead; this is a prerequisite operator-install step, separate from
+# applying this file. The native-NATS StatefulSet below needs no such fix, because
+# OCP already fills in its empty pod securityContext.
+apiVersion: argoproj.io/v1alpha1
+kind: EventBus
+metadata:
+  name: default
+  namespace: argo-events
+spec:
+  nats:
+    native:
+      replicas: 3
+      auth: token

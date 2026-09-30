@@ -1,0 +1,59 @@
+# Phase 00 applies this MachineConfig. It has no effect until you label nodes: it
+# attaches only to nodes with the label node-role.kubernetes.io/px-storage. Read the
+# warning below before you label any node.
+#
+# WARNING: Portworx internal KVDB needs a 3-node quorum. Check node roles with
+# `oc get nodes` before you label anything — do not assume a node's role from its
+# name. If your cluster has fewer than 3 eligible non-GPU worker nodes,
+# internal-KVDB Portworx on loopback storage is not usable. Use one of these paths
+# instead:
+#   - external KVDB (etcd) with 2 storage nodes
+#   - Pure CSI (pure-csi), which needs no KVDB and no loopback device
+# This file stays in the tree only as a reference for the loopback mechanism.
+#
+# This MachineConfig creates a file-backed loopback block device on each px-storage
+# node. Portworx uses this device as its storage pool and internal-KVDB device,
+# because the worker nodes have only one, fully-allocated OS disk and no spare
+# block device.
+#
+# Notes on the mechanism:
+#   - RHCOS does not pre-create /dev/loop0-7 at boot; only /dev/loop-control exists.
+#     The command `losetup /dev/loop7 <file>` loads the `loop` kernel module and
+#     creates the device automatically. This MachineConfig keeps a fixed index,
+#     /dev/loop7, so the StorageCluster `storage.devices` path stays the same
+#     every time. It runs `modprobe loop` first, as a safety step.
+#   - The service is idempotent. It attaches the device only if it is not already
+#     attached, so a reboot re-attaches it correctly and a repeat run cannot fail.
+#
+# WARNING: loopback storage is a spike expedient. It gives no OS-disk failure
+# isolation, and Portworx does not support it for production. Some Portworx
+# versions reject virtual devices at pool init. Test this on one node first.
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-px-storage-loopback
+  labels:
+    machineconfiguration.openshift.io/role: px-storage
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    systemd:
+      units:
+        - name: px-loopback-disk.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Portworx loopback backing device (FBDA pool + internal KVDB)
+            DefaultDependencies=no
+            After=local-fs.target
+            Before=kubelet.service
+            ConditionVirtualization=!container
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/bin/bash -c 'set -e; mkdir -p /var/px; [ -f /var/px/pool.img ] || /usr/bin/fallocate -l 64G /var/px/pool.img; /usr/sbin/modprobe loop 2>/dev/null || true; /usr/sbin/losetup -j /var/px/pool.img -O NAME -n | /usr/bin/grep -q . || /usr/sbin/losetup /dev/loop7 /var/px/pool.img'
+
+            [Install]
+            WantedBy=multi-user.target

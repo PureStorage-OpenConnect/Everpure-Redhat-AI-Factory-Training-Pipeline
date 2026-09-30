@@ -1,0 +1,32 @@
+# This file holds only half of a two-namespace feature. The other half is
+# base/20-events/s3-eventsource-sensor.yaml (EventSource, ServiceAccount, Sensor),
+# which lives in the argo-events namespace. Apply both halves together. Applying
+# only one leaves the S3 trigger loop non-functional.
+#
+# This Role and RoleBinding grant the argo-events ServiceAccount `s3-sensor`
+# permission to create RayJobs in the application namespace. The overlay sets the
+# namespace; this file does not. This grant is least-privilege: the ServiceAccount
+# may only create, get, and list RayJobs here. It cannot touch pods, PVCs, or
+# secrets, and it cannot delete anything. The RoleBinding binds a ServiceAccount
+# from a different namespace (argo-events), which RBAC allows.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: s3-sensor-rayjob
+rules:
+  - apiGroups: ["ray.io"]
+    resources: ["rayjobs"]
+    verbs: ["create", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: s3-sensor-rayjob
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: s3-sensor-rayjob
+subjects:
+  - kind: ServiceAccount
+    name: s3-sensor
+    namespace: argo-events

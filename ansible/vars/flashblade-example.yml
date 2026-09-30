@@ -1,0 +1,52 @@
+---
+# Example variables for flashblade-prepare.yml. Copy this file and edit the copy. Keep
+# your copy out of version control if your site treats endpoints as sensitive data.
+#
+# WARNING: this file must never hold a credential. The playbook reads the API token
+# from the PUREFB_API environment variable instead. If your platform needs a vault, put
+# fbda_fb_api_token in its own vault-encrypted file. The array returns this value only
+# once, at creation. If you lose it, you must create a new token.
+#
+# Pass this file to the playbook with `-e @` followed by its path. Always start with
+# --check. The README next to the playbook has the full command and prerequisites.
+
+# --- Connection ---------------------------------------------------------------------------
+# Leave both settings unset to use PUREFB_URL and PUREFB_API instead. Uncomment
+# fbda_fb_url only if you want to set the management endpoint here, not in the
+# environment.
+#
+# fbda_fb_url: "flashblade-mgmt.example.com"
+
+# The management certificate is self-signed until you install your own certificate.
+# Set this to false after you install your own certificate.
+fbda_disable_tls_warnings: true
+
+# --- The NFS data path --------------------------------------------------------------------
+# The data VIP your OpenShift nodes mount through. This is not the management endpoint.
+# The two are often on different networks. A working management path does not prove
+# the data path works. The playbook checks that this address is a data-service
+# interface on the same array as the token, and it stops if the check fails.
+fbda_nfs_data_vip: "192.0.2.10"
+
+# --- The NFS probe filesystem -------------------------------------------------------------
+# This filesystem is temporary. It lets you test the export rules and the
+# snapshot-directory setting from a node before you install Portworx. Delete it
+# after you finish testing.
+fbda_probe_filesystem: fbda-preflight-probe
+fbda_probe_size: 1G
+fbda_probe_export_rules: "*(rw,no_root_squash)"
+
+# --- Object store -------------------------------------------------------------------------
+# One account, one user, three buckets. Choose any names, but keep the three roles
+# distinct — see contract section 4. The pipeline reads these names from the
+# pipeline-config ConfigMap in your overlay (S3_DATA_BUCKET / S3_VALIDATION_BUCKET /
+# S3_REGISTRY_BUCKET in base/30-pipeline/pipeline-config.yaml). The three placeholder names
+# below match that ConfigMap's own shipped defaults (base/30-pipeline/pipeline-config.yaml) —
+# not the illustrative acme-corp-* names shown in README.md and
+# overlays/example/30-pipeline/kustomization.yaml. Replace all three with your own bucket
+# names together, do not just change this file.
+fbda_s3_account: fbda-pipeline
+fbda_s3_user: fbda-pipeline
+fbda_s3_bucket_training: my-models
+fbda_s3_bucket_validation: my-inbox
+fbda_s3_bucket_registry: my-registry

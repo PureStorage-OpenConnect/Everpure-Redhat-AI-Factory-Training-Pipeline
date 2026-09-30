@@ -1,0 +1,123 @@
+# This file turns on user-workload monitoring. It also gives Prometheus persistent storage.
+#
+# Without this file, a pipeline failure produces no alert. Prometheus holds the evidence,
+# but user-workload monitoring is off, so nothing can alert on the workload namespaces.
+# Without it, both ConfigMaps below are missing, and no pods run in the
+# openshift-user-workload-monitoring namespace.
+#
+# This file also lets existing rules run. The `kueue-prometheus-rules` object and the NFD
+# alert rules already exist on the cluster, but nothing evaluates them. Their namespaces do
+# not have the label `openshift.io/cluster-monitoring=true`, and UWM is off.
+#
+# HAZARD 1: `oc apply` replaces the whole ConfigMap. Check for an existing ConfigMap first.
+#   - The `config.yaml` key holds one text block, not separate fields.
+#   - `oc apply`, `oc patch --type=merge`, and `oc patch --type=strategic` all replace that
+#     whole text block. There is no partial merge inside it.
+#   - If a `cluster-monitoring-config` ConfigMap already exists on your cluster, applying
+#     this file deletes its settings without warning. This can include remote write, a
+#     telemetry proxy, node-exporter tuning, and Alertmanager sizing.
+#
+#   If the ConfigMap already exists, merge the settings by hand instead of applying this file:
+#     oc -n openshift-monitoring get cm cluster-monitoring-config -o jsonpath='{.data.config\.yaml}' \
+#       > /tmp/existing.yaml
+#     # Add the keys below into /tmp/existing.yaml. Keep the settings already there.
+#     oc -n openshift-monitoring create cm cluster-monitoring-config \
+#       --from-file=config.yaml=/tmp/existing.yaml --dry-run=client -o yaml | oc replace -f -
+#
+#   Kustomize cannot help here either. A patch in an overlay also replaces the whole text
+#   block, because Kustomize sees a string there, not a document.
+#
+# HAZARD 2: applying this file deletes the Prometheus history you have today.
+#   - Platform Prometheus today runs 15-day retention on `emptyDir` storage.
+#   - Adding a `volumeClaimTemplate` makes CMO recreate the StatefulSet. The emptyDir data
+#     is lost with the old pods.
+#   - This is a real loss, not a small one. The change that makes storage durable also
+#     erases what is stored today.
+#   - Apply this file only when you can afford to lose your current metrics history, for
+#     example not in the middle of an investigation.
+#
+# COST OF TURNING ON UWM: a `prometheus-user-workload` StatefulSet (2 replicas) and a
+# `thanos-ruler` pod start in openshift-user-workload-monitoring. Budget a few GiB of RAM
+# per node pair. UWM sends its alerts to the platform Alertmanager by default. This is why
+# one placeholder receiver (alertmanager-placeholder-receiver.yaml) covers both tiers.
+#
+# UWM SCOPE: UWM does not monitor `openshift-*` namespaces. It also skips any namespace
+# labelled `openshift.io/cluster-monitoring=true`; those namespaces belong to platform
+# monitoring. On this stack, only `nvidia-gpu-operator` carries that label. So DCGM stays on
+# the platform side, while `portworx`, `argo-events`, and `redhat-ods-applications` become
+# visible to UWM.
+#
+# STORAGE CLASS: `px-fb-direct-access-nfsv4-retain` is the retaining storage class that
+# base/10-storage creates. It is NFS-backed (Portworx `pure_file`).
+#   - Prometheus does not support NFS for its database. The store uses mmap, and upstream
+#     documentation calls non-POSIX and network filesystems unsupported and likely to corrupt.
+#   - This class is used here because it is the only retaining class this tree provisions.
+#   - If you have RWO block storage, set `storageClassName` in your overlay instead. See
+#     overlays/example/00-platform/kustomization.yaml.
+#   - Losing 30 days of metrics to a storage fault is a smaller problem than having no
+#     metrics at all, but it is still a real trade-off, made here on purpose.
+#
+# RETENTION is set to a generic value on purpose. 30 to 45 days is the useful range; 30 days
+# is the conservative choice. `retentionSize` is set below the volume size on purpose too.
+# Prometheus does not stop when the disk is full; it stalls. `retention` alone limits time,
+# not disk space.
+#
+# STORAGE IS PER REPLICA, NOT A TOTAL. CMO runs Prometheus with 2 replicas in each tier. So
+# the two `storage:` values below provision 2 × 100Gi + 2 × 50Gi = 300 GiB of PVCs, not
+# 150 GiB. Size your storage pool for 300 GiB before you apply this file, because it also
+# uses the NFS storage class described above.
+#
+# Verify:
+#   oc -n openshift-user-workload-monitoring get pods            # prometheus-user-workload-0/1 Running
+#   oc -n openshift-monitoring get pvc                           # prometheus-k8s-db-* Bound
+#   oc get prometheus -n openshift-monitoring k8s -o jsonpath='{.spec.retention}'   # -> 30d
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true
+    prometheusK8s:
+      retention: 30d
+      retentionSize: 80GiB
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: px-fb-direct-access-nfsv4-retain
+          resources:
+            requests:
+              storage: 100Gi
+---
+# The user-workload tier has its own config object, in its own namespace, with its own key
+# names (`prometheus:`, not `prometheusK8s:`). Setting retention in the ConfigMap above does
+# nothing for user-workload metrics. This looks configured, but it behaves like the default.
+#
+# This is where the metrics from this phase's ServiceMonitors land: KubeRay, Portworx CSI,
+# the Argo Events sensor, and the Kueue rules that now start to run.
+#
+# HAZARD 1 above also applies here. Same single-text-block key, same silent full replace.
+#
+# `thanosRuler` storage is not set on purpose. It holds rule state, not metric samples. If it
+# is lost on a restart, you lose one rule-evaluation cycle, not history. Add storage for it
+# if you start to use long `for:` durations in user-defined rules.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-workload-monitoring-config
+  namespace: openshift-user-workload-monitoring
+data:
+  config.yaml: |
+    prometheus:
+      retention: 30d
+      retentionSize: 40GiB
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: px-fb-direct-access-nfsv4-retain
+          resources:
+            requests:
+              storage: 50Gi

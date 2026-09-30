@@ -1,0 +1,90 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# EXAMPLE overlay. A customer copies this directory and edits it.
+#
+# THE OVERLAY CONTRACT. Read this before you change `namespace` below.
+#
+# This one line moves every resource in base/30-pipeline to a new namespace. Kustomize's
+# namespace transformer rewrites `metadata.namespace` on namespaced resources, renames the
+# Namespace object itself, and skips cluster-scoped built-in resources. It does NOT rewrite
+# the following items. You must change these in lockstep with the namespace:
+#
+#   1. In-cluster DNS names, for example `mlflow.<ns>.svc.cluster.local`. There are none in
+#      base/30-pipeline itself (only a comment mentions one) — the 7 real occurrences to edit
+#      are in base/40-workloads (4), base/50-stages (2), and base/20-events (1, the Sensor
+#      trigger template).
+#   2. base/20-events/s3-eventsource-sensor.yaml — the namespace INSIDE the Sensor's trigger
+#      template (the RayJob it creates), and the `queue-name` label there.
+#   3. The S3 bucket name (not a namespace, but it tracks the rename): edit
+#      base/30-pipeline/pipeline-config.yaml, or use the commented `configMapGenerator` block a
+#      few lines below in this same file.
+#   4. Kueue object names (`*-cq` / `*-lq`) and the `kueue.x-k8s.io/queue-name` label, if you
+#      rename them.
+#
+# The transformer DOES correctly handle same-namespace RoleBinding subjects, but only if
+# they carry no explicit `namespace:` field. Do not add one back. An explicit same-namespace
+# subject survives the transformer and silently binds to a ServiceAccount in the wrong
+# namespace. Genuine cross-namespace subjects, such as the argo-events ServiceAccount in
+# s3-sensor-rbac.yaml, must keep their explicit namespace.
+#
+# Changing `namespace` alone gives you a deployment that applies cleanly and does not work.
+namespace: ml-training
+
+# ---------------------------------------------------------------------------------------------
+# SET THE VOLUME HEADROOM THRESHOLD FOR YOUR CHECKPOINTS. The base ships a generic 100 GiB
+# floor, because it cannot know how large one of your checkpoints is. The threshold worth
+# having is ONE CHECKPOINT PLUS MARGIN, in absolute bytes; a percentage is the wrong
+# instrument here. On an 800 GiB volume, the platform's 3%-free alert fires at 24 GB. That is
+# ten times smaller than a single 366 GiB (~393 GB) training checkpoint. By the time the alert fires,
+# the write it warns about has already failed. And it fails QUIETLY: NFS reports ENOSPC at
+# close() or fsync(), not at write(), and DeepSpeed's checkpoint commit() function is
+# `return True`.
+#
+# Measure one checkpoint (run `du -sh` on the checkpoint directory), add margin, and
+# uncomment the block below:
+#
+# patches:
+#   - target:
+#       group: monitoring.coreos.com
+#       version: v1
+#       kind: PrometheusRule
+#       name: fbda-pipeline-alerts
+#     patch: |-
+#       - op: test
+#         path: "/spec/groups/1/rules/0/alert"
+#         value: FbdaVolumeHeadroomLow
+#       - op: replace
+#         path: "/spec/groups/1/rules/0/expr"
+#         value: |
+#           kubelet_volume_stats_available_bytes{persistentvolumeclaim="fbda-shared"} < 400 * 1024 * 1024 * 1024
+#
+# The `op: test` line is not just politeness. It checks that this patch is editing the rule
+# it expects. If base ever reorders its rules, the build fails loudly, instead of silently
+# rewriting the wrong alert's expression. This uses JSON 6902, not a strategic merge, because
+# PrometheusRule is a CRD. Kustomize would replace the entire `spec.groups` list otherwise,
+# and you would need to keep a copy of every rule.
+#
+# THE CANARY CronJob (pipeline-canary-cronjob.yaml) IS SUSPENDED IN BASE. Read its header
+# before you unsuspend it. As shipped, the Sensor has no data filter, so each canary object
+# starts a full GPU training run.
+# ---------------------------------------------------------------------------------------------
+
+# UNCOMMENT THIS BLOCK, AND CHANGE THE VALUES. Leaving it commented — or uncommenting it
+# unchanged — is the most costly mistake you can make here. Base ships `S3_DATA_BUCKET:
+# my-models` as a PLACEHOLDER value (along with `my-inbox` and `my-registry`), not a bucket
+# that exists on your array. A wrong bucket name does not fail when you apply the manifest.
+# It fails about 15 minutes into an 8-GPU run, with a NoSuchBucket error that does not name
+# the bucket. The literals below are illustrative real-looking names — replace them with your
+# own bucket names, not with the base placeholders shown above, or uncommenting this block
+# changes nothing.
+# configMapGenerator:
+#   - name: pipeline-config
+#     behavior: merge
+#     literals:
+#       - S3_DATA_BUCKET=acme-corp-training-datasets
+#       - S3_VALIDATION_BUCKET=acme-corp-inbox      # MUST differ from S3_DATA_BUCKET
+#       - S3_REGISTRY_BUCKET=acme-corp-model-registry
+
+resources:
+  - ../../../base/30-pipeline

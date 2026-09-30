@@ -1,0 +1,277 @@
+# This is a canary Job. It tests the full chain: S3 -> poller -> webhook -> Sensor -> RayJob.
+#
+# Why a canary, and not only a metric: Argo Events exports 4 counters (action_triggered,
+# action_failed, action_retries_failed, action_duration). There is no counter for events received,
+# events filtered, or unmet dependency conditions. If a trigger parameter names a dependency that
+# does not exist, Argo Events skips it silently. No error appears, and the trigger still reports
+# SUCCESS. The Sensor then creates a RayJob with a placeholder value instead of the real one, and
+# every metric still says the pipeline is healthy.
+#
+# The only way to catch this defect is to drive the whole chain from outside and check the result
+# at the far end. That is what this file does.
+#
+# ---------------------------------------------------------------------------------------------
+# Read this before you set suspend: false. It ships suspended on purpose, because turning it on
+# costs money.
+#
+# The Sensor in base/20-events has one trigger and no data filter. It cannot tell a canary object
+# from a real dataset object, so every canary run starts a full training RayJob (8 GPUs for about
+# two hours). At the schedule below (every 6 hours), that is 4 full training runs a day just to
+# test the control path.
+#
+# Before you unsuspend this CronJob, add a filter to the Sensor (not part of this file):
+#   - Add a `filters.data` rule on `body.key` in base/20-events/s3-eventsource-sensor.yaml.
+#   - Route the canary prefix to a second, cheap trigger (for example, a small ubi9 Job).
+#   - Add the matching filter to the existing trigger, so dataset objects still reach the RayJob.
+#   - Add both filters in the same change. Adding only one causes double firing or dropped events.
+#   - In the new trigger, name the parameter `dep-s3` (the only declared dependency). A different
+#     name repeats the same silent-skip defect this canary exists to catch.
+#
+# Until that filter exists, this CronJob is a documented procedure, not a running check. The
+# FbdaCanaryStale alert in pipeline-alerts-prometheusrule.yaml only fires when
+# `kube_cronjob_spec_suspend == 0`, so it stays quiet while this CronJob is suspended.
+#
+# To run it once by hand (only after the filter above exists, or if you accept the GPU cost):
+#   oc create job --from=cronjob/pipeline-canary canary-manual-$(date +%s)
+#   oc logs job/canary-manual-...     # each stage prints ok or FAIL and names what it checked
+# ---------------------------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pipeline-canary
+---
+# This Role gives read-only access. The canary checks the chain; it must never create the RayJob
+# it is checking for. Allow get and list only, on rayjobs only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pipeline-canary-rayjob-read
+rules:
+  - apiGroups: ["ray.io"]
+    resources: ["rayjobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pipeline-canary-rayjob-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pipeline-canary-rayjob-read
+subjects:
+  # Do not set a namespace here. The overlay's namespace transformer must set it. A namespace set
+  # here survives the transformer unchanged and points at the wrong ServiceAccount. The object
+  # applies without error but fails later with an RBAC denial. Check for an explicit `namespace:`
+  # on a same-namespace subject whenever you add or edit a RoleBinding in this phase.
+  - kind: ServiceAccount
+    name: pipeline-canary
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pipeline-canary
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  # Suspended by default. See the file header. Turning this on without the Sensor filter starts
+  # four 8-GPU training runs a day.
+  suspend: true
+  # Runs every 6 hours on purpose, because each run costs a real training run today. After the
+  # canary prefix routes to a cheap trigger, raise this to about every 30 minutes. A 6-hour
+  # feedback loop only tells you the pipeline broke, not when. If you raise the schedule, also
+  # lower FbdaCanaryStale's 8-hour window. Keep the alert window longer than one schedule interval,
+  # or it fires between healthy runs.
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  # Do not add ttlSecondsAfterFinished. FbdaCanaryStale reads kube_job_status_completion_time,
+  # which exists only while the Job object exists. A ttl deletes the Job, the metric disappears,
+  # and the alert then looks the same as a healthy pipeline. The history limits below keep the Job
+  # objects around instead: 3 successes at a 6-hour schedule keep the last known-good timestamp
+  # for about 18 hours, longer than the 8-hour alert window.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Set backoffLimit to 0. A canary that retries until it passes only measures its own
+      # patience. One attempt gives one result, so kube_job_status_failed means what it says.
+      backoffLimit: 0
+      # Set this value slightly above the two stage timeouts below (900 + 600 seconds). This stops
+      # a stuck curl or aws call from leaving the Job Running forever. A Job stuck Running gives
+      # neither a pass nor a fail, which is worse than either.
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          serviceAccountName: pipeline-canary
+          restartPolicy: Never
+          containers:
+            - name: canary
+              # Same image as s3-poller-cronjob.yaml. It has both the AWS CLI and curl, so one
+              # container and one image can do the S3 write and the Kubernetes API read.
+              image: docker.io/amazon/aws-cli:2.15.30
+              resources:
+                requests: {cpu: "50m", memory: 128Mi}
+                limits: {cpu: "500m", memory: 512Mi}
+              envFrom:
+                - configMapRef:
+                    name: pipeline-config
+              env:
+                # Get the bucket name, prefix, and poller state key from the ConfigMap. Do not use
+                # literal values. The canary must write to the same location the poller reads, and
+                # read the same state object the poller writes. A mismatched literal value here
+                # drifts silently from the poller's copy.
+                # Use configMapKeyRef, not "$(S3_...)": Kubernetes expands `$(VAR)` only from
+                # entries earlier in this same env list, never from envFrom. A `$(...)` reference
+                # to an envFrom value stays a literal string instead.
+                - name: BUCKET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pipeline-config
+                      key: S3_VALIDATION_BUCKET
+                - name: CANARY_PREFIX
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pipeline-config
+                      key: S3_CANARY_PREFIX
+                - name: STATE_KEY
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pipeline-config
+                      key: S3_POLLER_STATE_KEY
+                # Get the namespace to query through the downward API. base/30-pipeline sets no
+                # namespace anywhere (see that phase's kustomization.yaml); the overlay sets it
+                # at apply time. This is the only way to get the namespace at runtime without
+                # adding a literal value.
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                # Stage 2 checks that the RayJob was created. It is off by default, because with
+                # today's unfiltered Sensor, that RayJob is a real 8-GPU run. Turn it on in the
+                # same change that adds the Sensor filter.
+                - name: ASSERT_RAYJOB
+                  value: "false"
+                # Set this to 900 seconds (3 poller cycles at the shipped 5-minute schedule). One
+                # slow or missed cycle is not a failure; two in a row are.
+                - name: POLLER_TIMEOUT_SECONDS
+                  value: "900"
+                # Set this to 600 seconds, to cover Sensor dispatch plus KubeRay admission. This
+                # checks that the RayJob object exists, not that the run finished. Waiting for the
+                # training run to finish would turn the canary into a 2-hour GPU test instead.
+                - name: RAYJOB_TIMEOUT_SECONDS
+                  value: "600"
+                - name: S3_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: flashblade-s3
+                      key: S3_ENDPOINT
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: flashblade-s3
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: flashblade-s3
+                      key: AWS_SECRET_ACCESS_KEY
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -uo pipefail
+                  # TLS verification is off here, because the storage array used for testing has a
+                  # self-signed certificate. Do not copy this for real use. Use a CA bundle instead.
+                  AWS="aws --endpoint-url $S3_ENDPOINT --no-verify-ssl"
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  KEY="${CANARY_PREFIX}canary-${TS}-${HOSTNAME}.json"
+
+                  # Remove the canary object on exit, always. It is not a dataset, and it must not
+                  # build up in a bucket that people read. Deleting it cannot restart the pipeline:
+                  # the poller checks key and etag together, and each canary key has a new
+                  # timestamp. If delete fails, ignore the failure on purpose; an S3 account with
+                  # PutObject but not DeleteObject access must still pass the canary. If objects
+                  # build up under the canary prefix, add an S3 bucket lifecycle rule instead of
+                  # making cleanup a hard failure.
+                  cleanup() { $AWS s3 rm "s3://$BUCKET/$KEY" >/dev/null 2>&1 || :; }
+                  trap cleanup EXIT
+
+                  # STAGE 0 - check that the bucket exists.
+                  # Use head-bucket. It tells apart NoSuchBucket (404) and AccessDenied (403) from
+                  # an empty listing, which a plain listing cannot do on its own.
+                  if ! $AWS s3api head-bucket --bucket "$BUCKET" 2>/tmp/head.err; then
+                    echo "FAIL stage-0 bucket-unreachable: s3://$BUCKET :: $(tr -d '\n' < /tmp/head.err)" >&2
+                    exit 1
+                  fi
+                  printf '{"canary":true,"ts":"%s","pod":"%s"}\n' "$TS" "$HOSTNAME" > /tmp/canary.json
+                  if ! $AWS s3 cp /tmp/canary.json "s3://$BUCKET/$KEY" >/dev/null 2>/tmp/put.err; then
+                    echo "FAIL stage-0 put-failed: s3://$BUCKET/$KEY :: $(tr -d '\n' < /tmp/put.err)" >&2
+                    exit 1
+                  fi
+                  echo "stage-0 ok: wrote s3://$BUCKET/$KEY"
+
+                  # STAGE 1 - check that the poller saw the object and sent it to the webhook.
+                  # The poller writes its dedupe state only after every POST in the batch
+                  # succeeds. It exits with an error before writing state if any POST fails. So
+                  # finding this key in the state object proves three things at once: the poller
+                  # saw the object, the poller ran, and the EventSource accepted the event.
+                  deadline=$(( SECONDS + POLLER_TIMEOUT_SECONDS ))
+                  ok=0
+                  while :; do
+                    # Download the file first, then search it with grep. Do not pipe
+                    # `aws s3 cp -` into grep. With `set -o pipefail`, grep -q can close the pipe
+                    # early and cause a SIGPIPE in the aws process. The pipeline would then report
+                    # an error and the loop would keep waiting, even though it already found the key.
+                    $AWS s3 cp "s3://$BUCKET/$STATE_KEY" /tmp/seen.tsv >/dev/null 2>&1 || : > /tmp/seen.tsv
+                    if grep -qF "$KEY" /tmp/seen.tsv; then ok=1; break; fi
+                    if [ "$SECONDS" -ge "$deadline" ]; then break; fi
+                    sleep 30
+                  done
+                  if [ "$ok" -ne 1 ]; then
+                    echo "FAIL stage-1 poller-did-not-fire: $KEY absent from s3://$BUCKET/$STATE_KEY after ${POLLER_TIMEOUT_SECONDS}s. The poller did not list the object, or its POST to the EventSource failed. Check the s3-poller Job logs and that S3_CANARY_PREFIX is one of the prefixes the poller polls." >&2
+                    exit 1
+                  fi
+                  echo "stage-1 ok: poller listed and fired $KEY"
+
+                  if [ "$ASSERT_RAYJOB" != "true" ]; then
+                    echo "stage-2 skipped: ASSERT_RAYJOB=false — the Sensor and RayJob links are NOT covered by this run"
+                    exit 0
+                  fi
+
+                  # STAGE 2 - check that the Sensor turned the event into a RayJob with our key.
+                  # Match on the lineage annotation, not on a count of RayJobs. A count cannot
+                  # tell our event's RayJob apart from one made by a dataset upload. Worse, a
+                  # Sensor whose parameters silently fail to apply still creates a RayJob; that
+                  # RayJob holds the template placeholder instead of our key. A count-based check
+                  # would pass on exactly that defect.
+                  #
+                  # Read the RayJob list with curl and the ServiceAccount token, because this
+                  # image has no kubectl and no metric exists for RayJobs. kube-state-metrics here
+                  # is set up only for VerticalPodAutoscaler, so no `kube_customresource_*` series
+                  # exists for ray.io, and no PromQL alert can check whether a RayJob appeared.
+                  # The API is the source of truth; this
+                  # container turns that check into a metric through its own exit status.
+                  #
+                  # Match the key as plain text in the response body. The key is a timestamped
+                  # path that cannot appear anywhere else in the list, and this image has no jq.
+                  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                  CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                  URL="https://kubernetes.default.svc/apis/ray.io/v1/namespaces/${NAMESPACE}/rayjobs"
+                  deadline=$(( SECONDS + RAYJOB_TIMEOUT_SECONDS ))
+                  ok=0
+                  while :; do
+                    if curl -sS --cacert "$CA" -H "Authorization: Bearer $TOKEN" \
+                         "$URL" > /tmp/rayjobs.json 2>/tmp/api.err; then
+                      if grep -qF "$KEY" /tmp/rayjobs.json; then ok=1; break; fi
+                    else
+                      echo "WARN rayjob query failed: $(tr -d '\n' < /tmp/api.err)" >&2
+                    fi
+                    if [ "$SECONDS" -ge "$deadline" ]; then break; fi
+                    sleep 20
+                  done
+                  if [ "$ok" -ne 1 ]; then
+                    echo "FAIL stage-2 no-rayjob: no RayJob in $NAMESPACE annotated with $KEY after ${RAYJOB_TIMEOUT_SECONDS}s. The event reached the EventSource (stage 1 passed) but produced no RayJob carrying it. Look for a Sensor trigger parameter naming a dependency other than dep-s3 — that is skipped silently and the trigger still reports success." >&2
+                    exit 1
+                  fi
+                  echo "stage-2 ok: RayJob created carrying $KEY"
+                  echo "canary-ok: full chain S3 -> poller -> EventSource -> Sensor -> RayJob verified"

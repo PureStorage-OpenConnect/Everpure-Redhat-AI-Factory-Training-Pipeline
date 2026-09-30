@@ -1,0 +1,183 @@
+# This file is the FlashBlade OpenMetrics exporter: Namespace, ServiceAccount, Deployment,
+# Service.
+#
+# This exporter shows array-side truth. A `Retain` PV can leave an orphaned filesystem on the
+# array, and nothing else in the cluster can see it. `kubelet_volume_stats_*` describes a
+# mounted PVC, not a filesystem the cluster has forgotten about. This exporter is the only
+# source for that fact, and for confirming that N objects actually landed in a bucket.
+#
+# THIS IS A PROXY, NOT AN AGENT. THIS ONE FACT SHAPES THE WHOLE DESIGN.
+#   - The container holds no array address and no credential.
+#   - Prometheus supplies both on every scrape: the array address in a `?endpoint=<host>`
+#     query parameter, and the array's API token in an `Authorization: Bearer <token>`
+#     header.
+#   - The exporter opens a Purity//FB REST session for each scrape and translates the answer.
+#
+# Three consequences follow from this design:
+#   1. One Deployment can serve any number of arrays. To add a second array, add a second
+#      scrape job to the ServiceMonitor. Do not add a second Deployment.
+#   2. The exporter is stateless. It has no PVC and no leader election, but `replicas: 1` is
+#      REQUIRED, not merely safe — see the measured finding on the Deployment below for why
+#      raising it silently breaks the `purefb_clients_*` metrics.
+#   3. Everything specific to your environment lives in the ServiceMonitor and in a Secret.
+#
+# THIS EXPORTER DOES NOTHING UNTIL UWM IS ON. See cluster-monitoring-config.yaml. This
+# namespace does not carry the label `openshift.io/cluster-monitoring=true` on purpose: it is
+# a user workload, and platform Prometheus should not hold an array credential.
+#
+# Upstream project: github.com/PureStorage-OpenConnect/pure-fb-openmetrics-exporter
+# Upstream ships no ServiceMonitor and no OpenShift guidance. Its Helm chart is marked
+# "untested" and pins the `:latest` tag. Everything here is written for this tree, and the
+# tag used here is pinned.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flashblade-exporter
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+    # Pod Security Admission. The exporter uses an unprivileged port and needs no special
+    # capabilities. The `restricted` level is not just a goal here; the required-scc
+    # annotation below checks it.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flashblade-exporter
+  namespace: flashblade-exporter
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+# The exporter never calls the Kubernetes API. Do not mount a token it cannot use; an unused
+# token on disk is an unneeded credential.
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flashblade-exporter
+  namespace: flashblade-exporter
+  labels:
+    app.kubernetes.io/name: flashblade-exporter
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  # ONE REPLICA. THIS IS A MEASURED VALUE, NOT A PREFERENCE.
+  #   - The usual choice for a stateless proxy is 2 replicas, for availability. That choice
+  #     is wrong here. The reason is a property of the ARRAY, not of this Deployment.
+  #   - `/metrics/clients` runs as one query at a time on the array. Only one such query may
+  #     run per array. It takes about 15 seconds.
+  #   - A second request that arrives while the first is still running does not wait and
+  #     does not fail with an error. It returns HTTP 200 with an empty body, in about
+  #     0.04 seconds.
+  #   - A full response is 4.3 kB in 15.1 seconds; a blocked response is 206 bytes in
+  #     0.04 seconds.
+  #       - 2 requests at once: 1 full response (4339 B, 15.15 s), 1 empty response (206 B, 0.05 s)
+  #       - 4 requests at once: 1 full response (4264 B, 15.08 s), 3 empty responses (206 B, 0.05 s)
+  #       - 4 requests at once, with a scrape already running: 4 empty responses. All of them.
+  #   - A ServiceMonitor scrapes pod endpoints, not the Service address. OpenShift's
+  #     user-workload Prometheus runs 2 replicas, and both scrape every target at the same
+  #     time. So the number of requests hitting the array's one-deep queue is
+  #     (exporter replicas × 2):
+  #       - replicas: 2  ->  4 requests at once; 3 of them are guaranteed to return nothing
+  #       - replicas: 1  ->  2 requests at once; 1 of them returns nothing
+  #   - One replica does not remove the collision; Prometheus's own pair of replicas causes
+  #     it either way. But one replica halves the wasted REST sessions on the array, and it
+  #     loses no data: the metric still lands in whichever Prometheus replica won the race,
+  #     and query-time deduplication serves it correctly.
+  #   - THE FAILURE MODE IF YOU RAISE THIS VALUE: `up` stays at 1, the target stays green,
+  #     `scrape_duration` drops from 15 s to 0.03 s, and `purefb_clients_*` disappears with
+  #     no warning. It looks like "no NFS clients are connected." Watch
+  #     `scrape_samples_scraped{job="purefb-clients"}` instead of `up`. It reads 34 on this
+  #     array when the scrape works, and 1 when it loses the race.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flashblade-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flashblade-exporter
+        app.kubernetes.io/part-of: fbda-observability
+      annotations:
+        # WHY THIS ANNOTATION EXISTS, AND WHY "IT RAN FINE" IS NOT PROOF IT IS CORRECT.
+        #   - OpenShift picks an SCC by sorting every SCC the pod's ServiceAccount may use.
+        #     Without this annotation, the winner is whatever sorts first on your cluster.
+        #   - A pod with this exact pod spec can be admitted under a third-party CSI driver's
+        #     SCC instead of under restricted-v2. The pod runs, reports Running, and serves
+        #     metrics. But the annotation that records which security profile it got names a
+        #     different one.
+        #   - `openshift.io/required-scc` (OCP 4.15 and later) makes this a check at
+        #     admission time. If this pod spec ever stops meeting restricted-v2, the pod is
+        #     rejected, instead of being quietly admitted under a weaker profile. If you
+        #     remove this annotation, you lose the proof, not the function.
+        openshift.io/required-scc: restricted-v2
+    spec:
+      serviceAccountName: flashblade-exporter
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: exporter
+          # Pinned. Upstream's own chart pins `:latest`. A metrics proxy that silently
+          # changes its metric names under you is worse than one that is out of date.
+          image: quay.io/purestorage/pure-fb-om-exporter:v1.1.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9491
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # No runAsUser is set here. Let the SCC assign a UID from the namespace's UID
+          # range. Pinning a UID here is the usual way a manifest becomes non-portable
+          # between clusters.
+          #
+          # HTTP PROBES WOULD CAUSE AN OUTAGE. Every path this server exposes makes a live
+          # REST call to an array, and it has no health endpoint.
+          #   - A probe on `/metrics` would run the expensive full query on a schedule.
+          #   - A probe on `/metrics/array` needs a credential and an `endpoint` parameter
+          #     that the kubelet cannot supply. It would restart the pod whenever the array
+          #     was slow.
+          #   - TCP is the only honest liveness signal here.
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              # No CPU limit is set on purpose. A scrape is a burst of REST calls and JSON
+              # parsing. A CPU limit would turn a fast scrape into a timed-out one.
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flashblade-exporter
+  namespace: flashblade-exporter
+  labels:
+    app.kubernetes.io/name: flashblade-exporter
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  selector:
+    app.kubernetes.io/name: flashblade-exporter
+  ports:
+    - name: metrics
+      port: 9491
+      targetPort: metrics
+      protocol: TCP

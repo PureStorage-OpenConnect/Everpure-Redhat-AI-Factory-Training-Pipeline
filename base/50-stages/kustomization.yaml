@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Phase 50 — pipeline stages. The standard sequence does not apply this phase.
+#
+# These Jobs use artifacts that a training run produces: an evaluation report and a
+# promotion decision, both on the shared volume. This phase holds three Jobs —
+# eval-gate-pass, eval-gate-fail, and v9-register. If you apply them on a cluster
+# with no prior run, all three run immediately and fail because their input is
+# missing, leaving three permanently-Failed Jobs in an otherwise healthy namespace.
+#
+# Note that even after a real run, eval-gate-fail is DESIGNED to fail (exit 1): it
+# gates the same measured perplexity against a deliberately tight threshold to prove
+# the alert branch works. eval-gate-pass and v9-register are the two expected to
+# succeed. See ENVIRONMENT-CONTRACT.md section 6 / AGENTS.md for the full explanation.
+#
+# Apply these Jobs only after a run has produced their inputs.
+
+resources:
+  - eval-gate-job.yaml
+  - v9-register-job.yaml

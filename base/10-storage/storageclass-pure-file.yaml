@@ -1,0 +1,29 @@
+# Phase 10 applies this StorageClass, after the StorageCluster
+# (storagecluster-px-csi.yaml) reaches Online. The shipped pipeline does not
+# provision from this class today; the checkpoint volume uses
+# px-fb-direct-access-nfsv4-retain instead. This class stays as the RWX example the
+# smoke test in fbda-rwx-test.yaml uses.
+#
+# This is the FlashBlade Direct Access (FBDA) RWX StorageClass. When you create a
+# PVC, Portworx provisions an NFS filesystem and export on the FlashBlade, using
+# px-pure-secret, and mounts it ReadWriteMany into pods. The data path is: pod, NFS
+# client, then the FlashBlade data VIP. This is the RWX volume that the AI training
+# pods consume.
+#
+# Any node that mounts this volume needs the Portworx CSI node driver installed.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: px-flashblade-fbda
+provisioner: pxd.portworx.com
+parameters:
+  backend: "pure_file"
+  # These NFS export permissions apply to the FlashBlade filesystem. The
+  # no_root_squash setting lets container root write to the filesystem. Use a
+  # stricter setting for production.
+  pure_export_rules: "*(rw,no_root_squash)"
+mountOptions:
+  - nfsvers=4.1
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate

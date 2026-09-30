@@ -1,0 +1,38 @@
+# Snapshot-agent ServiceAccount + least-privilege RBAC.
+#
+# NOT CURRENTLY USED BY ANY AUTOMATION. Nothing in the training code creates a
+# VolumeSnapshot: checkpoints are snapshotted by hand, by applying
+# volumesnapshot-ckpt.yaml, and the training code only READS a VOLUME_SNAPSHOT_ID tag (set
+# outside the pod, after a snapshot exists) for MLflow logging. This ServiceAccount and its
+# Role/RoleBinding exist as the least-privilege identity a future automated snapshot step
+# would run as — it may CREATE/read VolumeSnapshots (and read the snapshot class), NOT
+# delete them (retention is enforced by deletionPolicy: Retain), and it has no access to
+# PVCs/PVs or any other resource. Nothing binds a pod to this ServiceAccount today.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ckpt-snapshotter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ckpt-snapshotter
+rules:
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["create", "get", "list", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ckpt-snapshotter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ckpt-snapshotter
+subjects:
+  - kind: ServiceAccount
+    name: ckpt-snapshotter

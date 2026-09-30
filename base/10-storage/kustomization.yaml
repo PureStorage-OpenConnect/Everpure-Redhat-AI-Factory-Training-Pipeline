@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Phase 10 — storage. StorageCluster and cloudsnap live in the product-owned `portworx`
+# namespace. StorageClass and VolumeSnapshotClass are cluster-scoped. None of these use
+# the customer namespace, so every namespace here is explicit; no overlay sets them.
+#
+# WARNING: cloudsnap-credential.yaml and cloudsnap-schedule.yaml are deliberately not in
+# the resources list below. Applying them pushes a placeholder credential
+# (`accessKeyID: "REPLACE_ME"`) into the `portworx` namespace, together with a
+# `BackupLocation` unrelated to this pipeline. Neither file is part of the documented
+# install. The files stay in the tree as a scaffold for later use. Add them to an
+# overlay yourself, with real credentials, when you have a backup target.
+#
+# WARNING: fbda-rwx-test.yaml is also deliberately not in the resources list below. It
+# is an opt-in smoke test, not part of the documented install. It creates a namespace, a
+# 10Gi RWX PVC, and two pods on the array. Its PVC uses StorageClass px-flashblade-fbda,
+# whose reclaim policy is Delete, so deleting the test namespace reclaims the FlashBlade
+# filesystem. Apply it by hand when you want to test the Portworx-to-FlashBlade RWX data
+# path. Its own header has the apply, verify, and clean commands.
+resources:
+  - storageclass-pure-file.yaml
+  - storageclass-snapclass-px-csi.yaml
+  - storagecluster-px-csi.yaml

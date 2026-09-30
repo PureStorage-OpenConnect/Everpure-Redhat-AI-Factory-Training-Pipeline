@@ -1,0 +1,40 @@
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: ml-training-cq
+spec:
+  flavorFungibility:
+    whenCanBorrow: Borrow
+    whenCanPreempt: TryNextFlavor
+  namespaceSelector: {}
+  preemption:
+    borrowWithinCohort:
+      policy: Never
+    reclaimWithinCohort: Never
+    withinClusterQueue: Never
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+  - coveredResources:
+    - cpu
+    - memory
+    - nvidia.com/gpu
+    - ephemeral-storage
+    flavors:
+    - name: gpu
+      resources:
+      - name: cpu
+        nominalQuota: '56'
+      - name: memory
+        nominalQuota: 1600Gi
+      - name: nvidia.com/gpu
+        nominalQuota: '8'
+      # 90Gi request per GPU worker (the base model download) × 8 GPU workers — the same "one
+      # training run at the configuration this was validated against" sizing as the other three
+      # resources. Every worker pod that requests ephemeral-storage also requests exactly one
+      # nvidia.com/gpu, so this scales with the GPU quota above by construction. A workload
+      # requesting a resource this ClusterQueue does not cover is not admitted, ever, with no
+      # error anywhere except a Kueue Workload condition ("resource ephemeral-storage
+      # unavailable in ClusterQueue") that nothing surfaces by default.
+      - name: ephemeral-storage
+        nominalQuota: 720Gi
+  stopPolicy: None

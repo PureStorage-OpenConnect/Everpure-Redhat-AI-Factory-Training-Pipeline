@@ -1,0 +1,140 @@
+# Alertmanager placeholder receiver. It silences AlertmanagerReceiversNotConfigured. It sends
+# notifications to nobody.
+#
+# Why this exists. This cluster has zero configured integrations, so
+# `AlertmanagerReceiversNotConfigured` fires all the time:
+#
+#   expr:  cluster:alertmanager_integrations:max == 0     (the shipped rule, for: 10m)
+#   live:  alertmanager_integrations 0                    (scraped from alertmanager-main-0)
+#
+# A warning that fires all the time is not harmless. It teaches everyone who reads the alert
+# list that the list is noise, and it hides the next real alert. Left unrouted, real failures
+# on this cluster produce zero notifications: nobody is paged, nobody gets mail.
+#
+# What this receiver does: nothing, on purpose. It must still be routed.
+# `placeholder-no-destination` has one webhook integration pointing at a `.invalid` host
+# (RFC 2606: guaranteed to never resolve). A child route matches it on `alertname =
+# PlaceholderNeverMatches`. Both parts are required.
+#
+#   * The route is what makes the metric move. Alertmanager's reload loop skips any receiver
+#     that no route references (log line: "skipping creation of receiver not referenced by
+#     any route"), and only then builds integrations and publishes the count. A receiver
+#     listed under `receivers:` but referenced by no route does NOT count toward
+#     alertmanager_integrations, even though it appears in the receiver list — in that
+#     unrouted state: alertmanager_receivers 3 (all routed, none with any *_configs),
+#     alertmanager_integrations 0.
+#   * The matcher is what keeps it silent. No rule in this cluster produces the alertname
+#     `PlaceholderNeverMatches`, so the route never actually delivers anything. If a future
+#     rule ever does use that alertname, delivery fails loudly against `.invalid`, instead of
+#     silently reaching a real destination.
+#
+# What this does not do: it has no effect on whether rules evaluate. Prometheus and Thanos
+# Ruler evaluate rules on their own, independent of Alertmanager receivers. Rules evaluate
+# and appear in the console because user-workload monitoring is on
+# (cluster-monitoring-config.yaml), not because of this file.
+#
+# Be clear about the state this leaves you in: alerts are visible (Console -> Observe ->
+# Alerting) and delivered nowhere. Nobody is paged. Nobody gets mail. Choosing a real
+# destination is your job; this file does not choose one for you. A wrong SMTP relay or a
+# stale Slack webhook shipped as a default would be worse than an obvious blank, because it
+# would look like it works.
+#
+# To make it real: replace the webhook url with your endpoint, and widen the route's
+# matcher, for example:
+#   - matchers: ["severity =~ critical|warning"]
+#     receiver: placeholder-no-destination
+# Verify with a command, do not assume:
+#   oc exec -n openshift-monitoring alertmanager-main-0 -c alertmanager -- \
+#     curl -s localhost:9093/metrics | grep '^alertmanager_integrations'
+# Expect 1 after you apply this file, and n after you wire n integrations. Then send a test
+# alert. After applying this file:
+#   alertmanager_integrations 1   (was 0)    alertmanager_receivers 4   (was 3)
+#   cluster:alertmanager_integrations:max -> 1, and the AlertmanagerReceiversNotConfigured
+#   alert stopped firing.
+#
+# HAZARD: this Secret is the entire Alertmanager config. `oc apply` replaces all of it.
+# If you already configured receivers, routes, inhibit rules, or mute-time intervals through
+# the console, which edits this same Secret, you lose every one of them. You find out only
+# when the next incident does not page. Merge the `receivers:` entry into your existing
+# config instead:
+#   oc -n openshift-monitoring get secret alertmanager-main \
+#     -o go-template='{{index .data "alertmanager.yaml" | base64decode}}' > /tmp/am.yaml
+#   # add ONLY the placeholder-no-destination receiver, keep everything else
+#   oc -n openshift-monitoring create secret generic alertmanager-main \
+#     --from-file=alertmanager.yaml=/tmp/am.yaml --dry-run=client -o yaml | oc replace -f -
+#
+# The body below is the OCP 4.18 default, plus one receiver. Applying it to a default
+# cluster changes only that one receiver. Applying it to a customized cluster wipes the
+# customization.
+#
+# Why this file uses stringData, not base64 `data`. A base64 blob is hard to review in a
+# diff, and a plain text-based review cannot read it: reviewing file content directly, a
+# hostname or token hidden in base64 is easy to miss. Plaintext here keeps this file
+# reviewable. Rule: never put a real credential-bearing URL in this file. A production
+# receiver's token belongs in a separate Secret, referenced with `*_file` config, never
+# written inline in this manifest.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-main
+  namespace: openshift-monitoring
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    global:
+      http_config:
+        proxy_from_environment: true
+    inhibit_rules:
+      - equal:
+          - namespace
+          - alertname
+        source_matchers:
+          - severity = critical
+        target_matchers:
+          - severity =~ warning|info
+      - equal:
+          - namespace
+          - alertname
+        source_matchers:
+          - severity = warning
+        target_matchers:
+          - severity = info
+    receivers:
+      - name: Default
+      - name: Watchdog
+      - name: Critical
+      # The placeholder receiver. It has one integration, and a route does reference it (see
+      # the never-matching child route below). An unrouted receiver builds no integrations
+      # and leaves the metric at zero. `.invalid` is reserved by RFC 2606 and can never
+      # resolve, so if a future edit widens the matcher, delivery fails loudly instead of
+      # quietly reaching a real destination.
+      - name: placeholder-no-destination
+        webhook_configs:
+          - url: http://alertmanager-placeholder.invalid/
+    route:
+      group_by:
+        - namespace
+      group_interval: 5m
+      group_wait: 30s
+      receiver: Default
+      repeat_interval: 12h
+      routes:
+        - matchers:
+            - alertname = Watchdog
+          receiver: Watchdog
+        - matchers:
+            - severity = critical
+          receiver: Critical
+        # This route routes nothing, and it is not optional. Alertmanager builds integrations
+        # only for receivers that some route references. Without this entry,
+        # `placeholder-no-destination` is skipped at reload, `alertmanager_integrations`
+        # stays at 0, and AlertmanagerReceiversNotConfigured keeps firing. Without this
+        # entry, the whole file does nothing.
+        #
+        # No rule produces the alertname `PlaceholderNeverMatches`, so this receiver is
+        # active but never receives an alert. Keep this route last. Child routes are checked
+        # in order, and the first match wins. A placeholder route ahead of Watchdog or
+        # Critical would become a real hazard the day someone widens its matcher.
+        - matchers:
+            - alertname = PlaceholderNeverMatches
+          receiver: placeholder-no-destination

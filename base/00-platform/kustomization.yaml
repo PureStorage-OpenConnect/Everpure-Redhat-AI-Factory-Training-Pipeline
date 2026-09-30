@@ -1,0 +1,64 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Phase 00: node platform. This has cluster-scoped MachineConfig and MachineConfigPool objects,
+# plus the DCGM console dashboard. The dashboard lives in the OpenShift-owned
+# `openshift-config-managed` namespace, so this file sets that namespace directly. An overlay
+# does not set it.
+#
+# WARNING: APPLYING THIS PHASE REBOOTS NODES WHEN THE px-storage POOL HAS MEMBERS TO
+# RECONFIGURE. On a fresh install, nothing has labeled a node into that pool yet (see
+# machineconfigpool-px-storage.yaml), so this phase reboots nothing. Once you label worker nodes
+# into the pool, applying this phase (or changing the MachineConfig it selects) rolls the pool
+# and reboots those nodes. Wait for the MachineConfigPool rollout to finish before you apply
+# phase 10. Portworx cannot install onto a node that is still rebooting.
+#
+# KUEUE QUOTA LIVES HERE, NOT WITH THE APPLICATION. ClusterQueue and ResourceFlavor are
+# cluster-scoped CRDs. Kustomize has no schema for them, so it cannot know this. Its namespace
+# transformer would add `metadata.namespace` to both objects, and the API server would then
+# reject them or misplace them. Keeping these objects in a phase with no namespace transformer
+# avoids that problem. The namespaced LocalQueue object stays in 30-pipeline.
+#
+# CLUSTER-SCOPED OBSERVABILITY OBJECTS ALSO LIVE HERE, for the same reason as the DCGM
+# dashboard: every object below names a namespace owned by a product (openshift-monitoring,
+# openshift-user-workload-monitoring, nvidia-gpu-operator, portworx, argo-events,
+# redhat-ods-applications), not by the customer's application. An overlay does not choose these
+# namespaces, and this phase runs no namespace transformer, so this file sets them directly.
+#
+# APPLY ORDER WITHIN THIS PHASE: apply cluster-monitoring-config.yaml first. Every ServiceMonitor
+# below does nothing until user-workload monitoring is running. They apply cleanly and report
+# success, but collect no metrics until then. Before you apply cluster-monitoring-config.yaml or
+# alertmanager-placeholder-receiver.yaml, read the warning in each file. Both objects replace
+# settings a cluster may already have, and the Prometheus object also deletes the existing
+# emptyDir metric history.
+
+resources:
+  - dcgm-console-dashboard.yaml
+  - training-run-console-dashboard.yaml
+  - kueue-clusterqueue.yaml
+  - kueue-resourceflavor-gpu.yaml
+  - machineconfig-px-loopback.yaml
+  - machineconfigpool-px-storage.yaml
+  # --- observability ----------------------------------------------------------------------
+  # Turn on UWM and keep Prometheus data. Nothing can alert on a workload
+  # namespace until this exists. Every rule below this line is a dashboard with no receiver
+  # until this is applied.
+  - cluster-monitoring-config.yaml
+  # One integration, so AlertmanagerReceiversNotConfigured stops firing. It sends alerts
+  # nowhere.
+  - alertmanager-placeholder-receiver.yaml
+  # SM_ACTIVE, ECC DBE, and clock-event reasons. These signals show the difference
+  # between training and a wedged job. This needs a matching ClusterPolicy patch; see the
+  # wiring block in the file.
+  - dcgm-exporter-counters.yaml
+  # Endpoints that already expose metrics but were never scraped.
+  - servicemonitor-kuberay-operator.yaml
+  - servicemonitor-portworx-csi.yaml
+  - servicemonitor-argo-events-sensor.yaml
+  # The array-side source of truth. This is the only view of a `Retain` PV's orphaned
+  # filesystem, and the only out-of-band check that objects actually landed. Unlike every other
+  # file in this phase, this one needs two things from you before it collects anything: the
+  # array address (an overlay patch) and a read-only array API token (a Secret not included in
+  # this tree). Both are documented in the ServiceMonitor.
+  - flashblade-exporter.yaml
+  - servicemonitor-flashblade-exporter.yaml

@@ -1,0 +1,176 @@
+# ServiceMonitor — FlashBlade OpenMetrics exporter, one scrape job per endpoint.
+#
+# Read base/00-platform/flashblade-exporter.yaml first. The exporter is a proxy. That is why
+# the array address and the array credential appear here, not on the Deployment.
+#
+# You must edit `params.endpoint` before this works.
+# Every job below points at `flashblade.example.com`, which does not exist. If you apply this
+# file unedited, all four targets go down with a name-resolution error. This is the correct
+# failure mode. Set the value to the management address (or FQDN) of your array's REST
+# endpoint. Do not use a data VIP.
+#   Edit it in your overlay, not here. See overlays/example/00-platform/kustomization.yaml for
+#   the JSON6902 patch. It needs one `op` per job, because it addresses jobs by index.
+#   If you have more than one array: copy the four entries and give each copy a different
+#   `endpoint` and a different `job` replacement. Do not deploy a second exporter. One proxy
+#   serves every array you own.
+#
+# The credential is not in this tree. This is deliberate.
+# `authorization.credentials` selects a key from a Secret in this namespace. Prometheus sends
+# it as `Authorization: Bearer <token>`. Create the Secret yourself:
+#
+#   oc create secret generic flashblade-exporter-token -n flashblade-exporter \
+#     --from-literal=token='<your array API token>'
+#
+# The token must belong to a `readonly` array admin. Prometheus sends it on every scrape, and
+# anyone who can read Secrets in this namespace can read it. An `array_admin` token here turns
+# a monitoring credential into a full array credential. Purity//FB has a built-in `readonly`
+# role. Create a dedicated admin account for this, and use it for nothing else.
+#
+# What this deliberately does not scrape:
+#   - `/metrics` (root): upstream calls this an expensive query. It re-runs every collector in
+#     one request. The per-endpoint jobs below get the same data for less array-side cost, and
+#     each job can use its own interval.
+#   - `/metrics/usage`: known slow, an open upstream issue. Per-user and per-group quota data
+#     does not answer any question this pipeline asks.
+#   - `/metrics/policies`: returns one metric family and one sample on a live array. It shows
+#     nothing you cannot already see in the array UI.
+#
+# Do not set any interval below 30s. Each of these is a live REST call to a production array,
+# not a local file read, and the array pays a cost for each one.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: flashblade-exporter
+  namespace: flashblade-exporter
+  labels:
+    app.kubernetes.io/name: flashblade-exporter
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flashblade-exporter
+  endpoints:
+    # Every entry below overrides the `job` label. Do not remove this relabeling.
+    # prometheus-operator sets the `job` label from the Service name and the `endpoint` label
+    # from the port name. All four entries share one Service and one port. Without an
+    # override, all four targets would get the same job, instance, and endpoint labels.
+    # Prometheus would then write four different `up` series to one identity, and the four
+    # jobs would overwrite each other's staleness markers.
+    #
+    # This relabeling runs after the operator's own rules, so it wins. It also makes the
+    # Targets page readable: for example, `purefb-array` instead of four identical rows.
+
+    # --- /metrics/array — the main metrics come from here --------------------------------------
+    # Serves purefb_array_performance_bandwidth_bytes{protocol=~"NFS|S3"},
+    # purefb_array_performance_latency_usec, purefb_array_space_bytes, purefb_alerts_open,
+    # purefb_hardware_health, and purefb_hardware_connectors_performance_bandwidth_bytes.
+    # Three of the four key metrics for this deployment come from this one endpoint.
+    # Measured at about 0.1 seconds per scrape, so 30s is a cheap and polite interval.
+    - port: metrics
+      path: /metrics/array
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s
+      params:
+        endpoint: ["flashblade.example.com"]
+      authorization:
+        credentials:
+          name: flashblade-exporter-token
+          key: token
+      relabelings:
+        - targetLabel: job
+          replacement: purefb-array
+
+    # --- /metrics/filesystems -----------------------------------------------------------------
+    # purefb_file_systems_space_bytes, per filesystem. This is the only way to see a filesystem
+    # the cluster has forgotten. Deleting a `Retain` PV from Kubernetes leaves the array-side
+    # filesystem in place. No in-cluster metric describes a volume that nothing mounts.
+    - port: metrics
+      path: /metrics/filesystems
+      scheme: http
+      interval: 60s
+      scrapeTimeout: 15s
+      params:
+        endpoint: ["flashblade.example.com"]
+      authorization:
+        credentials:
+          name: flashblade-exporter-token
+          key: token
+      relabelings:
+        - targetLabel: job
+          replacement: purefb-filesystems
+
+    # --- /metrics/objectstore -----------------------------------------------------------------
+    # purefb_buckets_object_count and purefb_buckets_space_bytes. This checks, from outside the
+    # pipeline, that objects actually arrived. It does not depend on the poller, which can
+    # swallow a NoSuchBucket error and report `new-objects-fired=0` as success.
+    - port: metrics
+      path: /metrics/objectstore
+      scheme: http
+      interval: 60s
+      scrapeTimeout: 15s
+      params:
+        endpoint: ["flashblade.example.com"]
+      authorization:
+        credentials:
+          name: flashblade-exporter-token
+          key: token
+      relabelings:
+        - targetLabel: job
+          replacement: purefb-objectstore
+
+    # --- /metrics/clients — read this before you change the timeout ----------------------------
+    # This endpoint takes about 15 seconds to answer. Measured repeatedly on a live, idle
+    # array: the other three endpoints answer in under 0.11 s. This one took 15.07 s and
+    # 15.08 s across 34 samples, the same 15 s no matter how many clients were connected.
+    #
+    # Prometheus's default scrape timeout is 10s. At the default, this job fails every scrape
+    # with a context deadline. The failure is easy to miss: `up` stays 1 for the other three
+    # jobs, the Targets page shows one red row among three green rows, and every per-client
+    # series is simply absent — which looks the same as "no clients are connected".
+    #
+    # This is why the interval is 60s and the timeout is 45s. Prometheus rejects a
+    # scrapeTimeout greater than the interval, so change these two values together, or not
+    # at all.
+    #
+    # The 15 seconds is also a lock, not only latency. The array answers one client-performance
+    # query at a time. A request that arrives while another is in flight gets HTTP 200 with an
+    # empty body in about 0.04 s — no error, no non-2xx status, and `up` stays 1. See the
+    # replica-count note in flashblade-exporter.yaml — that is why that Deployment runs
+    # exactly one pod.
+    #
+    # The only honest health check for this job is the sample count, not `up`:
+    #     scrape_samples_scraped{job="purefb-clients"}
+    #     One sample per connected NFS client, times 5 metric families, or 1 if this scrape
+    #     lost the race for the lock.
+    # An alert on `up` here can never fire for the failure that actually happens. Use
+    # `absent(purefb_clients_performance_bandwidth_bytes)` instead.
+    - port: metrics
+      path: /metrics/clients
+      scheme: http
+      interval: 60s
+      scrapeTimeout: 45s
+      params:
+        endpoint: ["flashblade.example.com"]
+      authorization:
+        credentials:
+          name: flashblade-exporter-token
+          key: token
+      relabelings:
+        - targetLabel: job
+          replacement: purefb-clients
+      # What the `name` label contains — read this before you build a per-node panel.
+      # `purefb_clients_performance_*{name="<address>:<source-port>"}`. The address is the
+      # NFS client's address. For a Kubernetes cluster, that is the node's storage-network
+      # address. The kubelet does the mount, so no pod identity is present in this data.
+      # Per-node attribution works. Per-pod attribution is never possible.
+      #
+      # Two problems this causes for a naive dashboard:
+      #   1. The `:<source-port>` suffix is part of the label, so `name` does not match a
+      #      node address directly. Strip it first:
+      #        label_replace(purefb_clients_performance_bandwidth_bytes,
+      #                      "node_ip", "$1", "name", "([^:]+):.*")
+      #   2. The port is a new, random port after every remount. The series identity changes
+      #      on every remount: the old series goes stale, and a new one starts at zero.
+      #      Always aggregate by the stripped address. Never plot `name` directly.
+      # A node with no current mount is absent from this data. It is not shown as zero.

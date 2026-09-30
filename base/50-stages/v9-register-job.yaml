@@ -1,0 +1,348 @@
+# Register the model in MLflow and export it to S3 in SafeMode.
+#
+# This job reads eval-report-v8.json and promote-v8.json from fbda-shared. It uploads a lineage
+# package to s3://my-registry/qwen3-fbda-finetune/v1/ with SafeMode object-lock on. Then it
+# registers a ModelVersion in the running MLflow server, with full lineage tags, and sets the
+# stage to Production.
+#
+# RHOAI Model Registry integration is not yet implemented; this MLflow-based job is the
+# current registration mechanism.
+#
+# Apply: oc -n ml-training apply -f v9-register-job.yaml
+# Watch: oc -n ml-training logs -f job/v9-register
+# Expect: "V9 COMPLETE: MLflow=qwen3-fbda-finetune v1 (Production) | SafeMode=s3://my-registry/..."
+#
+# WARNING: the `-n` flag in the commands above is required. If you omit it, the job fails with no
+# error message. These manifests set no `metadata.namespace` on purpose, because the Kustomize
+# overlay sets it (`overlays/example/*/kustomization.yaml` sets `namespace:`). A bare `oc apply -f`
+# creates the object in your current context's namespace instead. Kueue finds no LocalQueue there
+# and suspends the job. `oc apply` reports success, but `oc -n <expected-ns> get rayjob` shows
+# nothing, and nothing explains why. Use `make apply-phase OVERLAY=overlays/<yours> PHASE=<phase>`
+# instead. It always goes through the overlay.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: v9-register-code
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+data:
+  register.py: |
+    #!/usr/bin/env python3
+    """
+    V9: MLflow Model Registry registration + SafeMode S3 export.
+    No GPU required. Reads lineage artifacts from fbda-shared, uploads to
+    SafeMode S3 (versioning+object-lock), registers MLflow ModelVersion.
+    """
+    import json
+    import os
+    import tempfile
+    import pathlib
+    import warnings
+    from datetime import datetime, timezone
+
+    warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+    import boto3
+    from botocore.config import Config
+    import mlflow
+    from mlflow.tracking import MlflowClient
+
+    # Config
+    MLFLOW_URI      = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow.ml-training.svc.cluster.local:5000")
+    MLFLOW_EXPT     = os.environ.get("MLFLOW_EXPERIMENT", "qwen3-fbda")
+    MODEL_NAME      = "qwen3-fbda-finetune"
+    FBDA            = "/mnt/fbda"
+    EVAL_REPORT     = os.path.join(FBDA, "eval-report-v8.json")
+    PROMOTE_MARKER  = os.path.join(FBDA, "promote-v8.json")
+    S3_BUCKET       = os.environ.get("S3_REGISTRY_BUCKET", "my-registry")
+    S3_PREFIX       = "qwen3-fbda-finetune/v1"
+    S3_VALIDATION_BUCKET = os.environ.get("S3_VALIDATION_BUCKET", "my-inbox")
+    GIT_SHA         = os.environ.get("GIT_SHA", "REPLACE-ME")
+    if GIT_SHA == "REPLACE-ME":
+        raise SystemExit(
+            f"GIT_SHA is {GIT_SHA!r} — it was not substituted. Refusing to run: this job's S3 "
+            "upload is under SafeMode object-lock, so the resulting lineage record is immutable "
+            "once written, and an unsubstituted GIT_SHA placeholder would be permanent for this "
+            "model version. Set GIT_SHA to the actual commit before applying."
+        )
+    IMAGE_DIGEST    = os.environ.get("IMAGE_DIGEST",
+                          "odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869")
+    # SNAP_ID is the fixed name of the VolumeSnapshot that base/30-pipeline/volumesnapshot-ckpt.yaml
+    # applies (see that file). It is a real, constant resource name, not a per-run placeholder.
+    SNAP_ID         = "fbda-ckpt-v9"
+
+    def log(msg): print(f"[v9] {msg}", flush=True)
+
+    # Load eval artifacts
+    log(f"Reading {EVAL_REPORT}")
+    with open(EVAL_REPORT) as f:
+        eval_report = json.load(f)
+    log(f"Reading {PROMOTE_MARKER}")
+    with open(PROMOTE_MARKER) as f:
+        promote = json.load(f)
+
+    ppl       = float(eval_report["perplexity"])
+    mean_loss = float(eval_report["mean_loss"])
+    # `eval_report["run_id"]` is the EVAL JOB's own identity (rayjob-eval-v8.yaml sets RUN_ID to
+    # the fixed string "fbda-eval-v8" for every eval run — see that file's own comment: "This is
+    # the job's own identity, for MLflow. It is NOT the RUN_ID of the run you are evaluating.").
+    # The actual training run's
+    # identity is `resume_from`, the checkpoint directory the eval job was told to load
+    # (`/mnt/fbda/ckpt-<real-run-id>` — see RESUME_FROM in base/40-workloads/rayjob-eval-v8.yaml
+    # or base/40-workloads/rayjob-resume-v5.yaml).
+    resume_from = eval_report.get("resume_from", "").rstrip("/")
+    if not resume_from:
+        raise SystemExit(
+            f"{EVAL_REPORT} has no resume_from. V9 registration writes an immutable SafeMode "
+            "record and refuses to guess which training run this evaluated. Re-run the eval gate "
+            "against a report produced with RESUME_FROM set to a real checkpoint directory."
+        )
+    train_run = os.path.basename(resume_from).removeprefix("ckpt-")
+    # GLOBAL_STEP and the checkpoint run identifier used below come from the eval report itself,
+    # not from a fixed constant. eval-gate-job.yaml's gate.py refuses to write promote-v8.json
+    # unless the report has a real, non-empty global_step (see its INCONCLUSIVE check), so by the
+    # time this job runs, the eval report this job reads is guaranteed to carry a genuine step.
+    # Do not hard-code this value — always read it from the report, since it differs by run.
+    # This job's S3 upload is under SafeMode object-lock, so an incorrect
+    # value here is permanent for that model version; refuse to run rather than fabricate one.
+    GLOBAL_STEP = eval_report.get("global_step")
+    if not isinstance(GLOBAL_STEP, int) or GLOBAL_STEP <= 0:
+        raise SystemExit(
+            f"{EVAL_REPORT} has global_step={GLOBAL_STEP!r}. V9 registration writes an immutable "
+            "SafeMode record and refuses to bake in a placeholder step. Re-run the eval gate "
+            "against a report that actually loaded a checkpoint (see eval-gate-job.yaml's "
+            "INCONCLUSIVE check for what a valid report requires)."
+        )
+    log(f"Loaded: perplexity={ppl:.4f} mean_loss={mean_loss:.4f} train_run={train_run} global_step={GLOBAL_STEP}")
+
+    # Build lineage manifest
+    lineage = {
+        "model_name":          MODEL_NAME,
+        "version":             "v1",
+        "volume_snapshot_id":  SNAP_ID,
+        "global_step":         GLOBAL_STEP,
+        "perplexity":          ppl,
+        "mean_loss":           mean_loss,
+        "eval_samples":        eval_report.get("eval_samples", 64),
+        "training_run_id":     train_run,
+        "gate_decision":       promote.get("decision", "promote"),
+        "git_sha":             GIT_SHA,
+        "training_image":      IMAGE_DIGEST,
+        "dataset_source":      f"s3://{S3_VALIDATION_BUCKET}/incoming/",
+        # train_run is parsed from resume_from above — see that block for why eval_report's own
+        # run_id field is the wrong source. This reconstructs the same path resume_from named.
+        "checkpoint_path":     f"{FBDA}/ckpt-{train_run}/global_step{GLOBAL_STEP}",
+        "eval_report_path":    EVAL_REPORT,
+        "promote_marker_path": PROMOTE_MARKER,
+        "registered_at":       datetime.now(timezone.utc).isoformat(),
+        "registry":            "mlflow",
+        "rhoai_mr_status":     "deferred-no-flasharray-block-sc",
+    }
+
+    # SafeMode S3 export
+    log(f"Connecting to S3 at {os.environ['S3_ENDPOINT']}")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.environ["S3_ENDPOINT"],
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        config=Config(signature_version="s3v4"),
+        # WARNING: TLS verification is off here. The storage array used for validation had a
+        # self-signed certificate. Do not copy this setting. Use a CA bundle instead.
+        verify=False,
+    )
+
+    def s3_put(key, body, content_type="application/json"):
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType=content_type)
+        log(f"  uploaded s3://{S3_BUCKET}/{key}")
+
+    s3_put(f"{S3_PREFIX}/lineage.json",           json.dumps(lineage, indent=2))
+    s3_put(f"{S3_PREFIX}/eval-report.json",       open(EVAL_REPORT).read())
+    s3_put(f"{S3_PREFIX}/promote.json",           open(PROMOTE_MARKER).read())
+    s3_put(f"{S3_PREFIX}/checkpoint-pointer.txt",
+           f"VolumeSnapshot: {SNAP_ID}\nglobal_step: {GLOBAL_STEP}\n"
+           f"path: {FBDA}/ckpt-{train_run}/global_step{GLOBAL_STEP}\n",
+           content_type="text/plain")
+    log("SafeMode S3 export complete.")
+
+    # Check that the object exists. This confirms object-lock accepted the write.
+    head = s3.head_object(Bucket=S3_BUCKET, Key=f"{S3_PREFIX}/lineage.json")
+    log(f"SafeMode verify: lineage.json ETag={head['ETag']} VersionId={head.get('VersionId','none')}")
+
+    # MLflow registration
+    mlflow.set_tracking_uri(MLFLOW_URI)
+    mlflow.set_experiment(MLFLOW_EXPT)
+    log(f"MLflow tracking URI: {MLFLOW_URI} experiment: {MLFLOW_EXPT}")
+
+    # Log a registration run with all lineage data.
+    with mlflow.start_run(run_name="v9-register-v1") as run:
+        run_id = run.info.run_id
+        # Params: lineage fields that are not numbers
+        mlflow.log_params({
+            "model_name":         MODEL_NAME,
+            "version":            lineage["version"],
+            "volume_snapshot_id": SNAP_ID,
+            "git_sha":            GIT_SHA,
+            "training_run_id":    train_run,
+            "gate_decision":      lineage["gate_decision"],
+            "dataset_source":     lineage["dataset_source"],
+            "training_image":     IMAGE_DIGEST[:60],  # MLflow param length limit
+            "safemodes3_prefix":  f"s3://{S3_BUCKET}/{S3_PREFIX}",
+            "registered_at":      lineage["registered_at"],
+        })
+        mlflow.log_metrics({
+            "perplexity":   ppl,
+            "mean_loss":    mean_loss,
+            "global_step":  float(GLOBAL_STEP),
+            "eval_samples": float(lineage["eval_samples"]),
+        })
+        mlflow.set_tags({
+            "stage":              "v9-registration",
+            "registry":           "mlflow",
+            "volume_snapshot_id": SNAP_ID,
+        })
+        # Log lineage files as artifacts. MLflow stores them in the FBDA artifact store.
+        with tempfile.TemporaryDirectory() as td:
+            td = pathlib.Path(td)
+            (td / "lineage.json").write_text(json.dumps(lineage, indent=2))
+            (td / "eval-report.json").write_text(open(EVAL_REPORT).read())
+            (td / "promote.json").write_text(open(PROMOTE_MARKER).read())
+            mlflow.log_artifacts(str(td), artifact_path="lineage")
+        log(f"MLflow run logged: run_id={run_id}")
+
+    # Register a ModelVersion from the logged run's artifacts.
+    # Use client.create_model_version() directly. mlflow.register_model() calls
+    # search_logged_models (/api/2.0/mlflow/logged-models/search). That API needs a newer
+    # server version than the one installed here, and it returns a 404 error.
+    client = MlflowClient()
+    try:
+        client.create_registered_model(
+            MODEL_NAME,
+            description=(f"Qwen3-32B fine-tuned on example-cluster FlashBlade pipeline. "
+                         f"Snapshot={SNAP_ID} global_step={GLOBAL_STEP} "
+                         f"perplexity={ppl:.4f}. SafeMode=s3://{S3_BUCKET}/{S3_PREFIX}"),
+        )
+        log(f"Created registered model: {MODEL_NAME}")
+    except Exception as e:
+        if "RESOURCE_ALREADY_EXISTS" in str(e) or "already exists" in str(e).lower():
+            log(f"Registered model already exists: {MODEL_NAME}")
+        else:
+            raise
+
+    # Get the artifact URI for this run. In serve-artifacts mode, this uses the
+    # mlflow-artifacts:/ scheme.
+    artifact_uri = client.get_run(run_id).info.artifact_uri
+    log(f"Run artifact URI: {artifact_uri}")
+
+    mv = client.create_model_version(
+        name=MODEL_NAME,
+        source=f"{artifact_uri}/lineage",
+        run_id=run_id,
+        description=f"global_step={GLOBAL_STEP}, perplexity={ppl:.4f}, snapshot={SNAP_ID}",
+        tags={
+            "volume_snapshot_id": SNAP_ID,
+            "global_step":        str(GLOBAL_STEP),
+            "perplexity":         f"{ppl:.4f}",
+            "mean_loss":          f"{mean_loss:.4f}",
+            "git_sha":            GIT_SHA,
+            "training_image":     IMAGE_DIGEST[:120],
+            "gate_decision":      lineage["gate_decision"],
+            "safemodes3":         f"s3://{S3_BUCKET}/{S3_PREFIX}",
+            "eval_report":        EVAL_REPORT,
+            "promote_marker":     PROMOTE_MARKER,
+        },
+    )
+    log(f"Registered ModelVersion: {mv.name} v{mv.version} source={mv.source}")
+
+    # Move the model to the Production stage.
+    client.transition_model_version_stage(
+        MODEL_NAME, mv.version, stage="Production", archive_existing_versions=True
+    )
+    log(f"Stage → Production: {MODEL_NAME} v{mv.version}")
+
+    # Write local receipt
+    receipt = {
+        **lineage,
+        "mlflow_run_id":       run_id,
+        "mlflow_model_name":   mv.name,
+        "mlflow_model_version": mv.version,
+        "mlflow_model_stage":  "Production",
+        "safemodes3_prefix":   f"s3://{S3_BUCKET}/{S3_PREFIX}",
+    }
+    receipt_path = os.path.join(FBDA, "v9-register-receipt.json")
+    with open(receipt_path, "w") as f:
+        json.dump(receipt, f, indent=2)
+    log(f"Receipt written to {receipt_path}")
+    log(f"V9 COMPLETE: MLflow={MODEL_NAME} v{mv.version} (Production) | "
+        f"SafeMode=s3://{S3_BUCKET}/{S3_PREFIX} | receipt={receipt_path}")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v9-register
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: pip-install
+          image: registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --quiet --no-color mlflow-skinny==3.15.1 boto3==1.35.36 2>&1 | tail -5 && echo "pip OK"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile: { type: RuntimeDefault }
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: pip-cache
+              mountPath: /tmp/pip
+      containers:
+        - name: register
+          image: registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --quiet --no-color mlflow-skinny==3.15.1 boto3==1.35.36 2>&1 | tail -3 && python3 /register/register.py
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.ml-training.svc.cluster.local:5000"
+            - name: MLFLOW_EXPERIMENT
+              value: "qwen3-fbda"
+            - name: GIT_SHA
+              value: "REPLACE-ME"
+            - name: S3_ENDPOINT
+              valueFrom: { secretKeyRef: { name: flashblade-s3, key: S3_ENDPOINT } }
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: flashblade-s3, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: flashblade-s3, key: AWS_SECRET_ACCESS_KEY } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile: { type: RuntimeDefault }
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "500m", memory: 512Mi }
+            limits:   { cpu: "1",    memory: 1Gi }
+          volumeMounts:
+            - name: fbda-shared
+              mountPath: /mnt/fbda
+            - name: register-code
+              mountPath: /register
+      volumes:
+        - name: fbda-shared
+          persistentVolumeClaim:
+            claimName: fbda-shared
+        - name: register-code
+          configMap:
+            name: v9-register-code
+        - name: pip-cache
+          emptyDir: {}

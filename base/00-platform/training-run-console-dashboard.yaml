@@ -1,0 +1,609 @@
+# Training-run console dashboard. It shows what a run is doing, and its storage cost in GPU time.
+#
+# WHY THIS DASHBOARD EXISTS. The DCGM dashboard (utilization, framebuffer, power, temperature)
+# does not show run phase, checkpoint status, or storage activity, and its default window is
+# `now-1h`, shorter than a full run. A viewer who opens it mid-run sees a flat line with no
+# context. This dashboard adds the missing visibility: which phase a run is in, whether the
+# checkpoint has landed, and storage activity around it.
+#
+# YOU CANNOT FIX THE DEFAULT WINDOW FROM THIS FILE. The console, not this file, owns the time
+# range. The Time Range control defaults to Last 30 minutes, and it ignores the `time` key below
+# entirely. The `time` key stays in the JSON only so it still means something if you import this
+# file into a real Grafana. A viewer who opens this dashboard cold still sees a flat line, for the
+# same reason as the DCGM dashboard.
+#
+# To send someone straight to a specific window, set `timeRange` and `endTime` as URL query
+# params on the dashboard link (add `&namespace=<ns>` to set the namespace variable). This is the
+# only way to link directly to a specific window; the console ignores the `time` key in the JSON.
+#
+# Panels 2-9 use only metrics platform Prometheus already scrapes, so they need no user-workload
+# monitoring, no Grafana install, and no exporter. This matters: a panel that queries a series
+# nobody produces looks the same as a healthy system.
+#
+# PANELS 10 AND 11 ARE DIFFERENT. They query `ray_training_global_step` and
+# `ray_training_steps_completed_total`, which platform Prometheus does not scrape. They need the
+# additional scrape path in base/30-pipeline/podmonitor-ray-metrics.yaml (user-workload monitoring
+# on the application namespace), not platform Prometheus.
+# ------------------------------------------------------------------------------------------------
+# THE FINDING THIS DASHBOARD WAS BUILT TO SHOW. This is why panel 2 comes first.
+#
+# In a representative run:
+#
+#   DCGM_FI_PROF_GR_ENGINE_ACTIVE   0.997 for about 2 hours of training, then:
+#     training              0.997
+#     checkpoint barrier    0.008
+#     GPUs idle             0.000  (8x L40S idle)
+#     run ends
+#
+#   FlashBlade, same window:      S3 write sustained at about 940 MB/s for about 7 minutes
+#   FlashBlade, moments earlier:  NFS checkpoint write, 13,178 writes/s at 6,909 MB/s
+#
+# For about 7 minutes, all eight GPUs sit idle: about 56 GPU-minutes, about 5% of the run. This
+# time goes to an S3 upload running at about 940 MB/s, on an array that had just written at 6.9
+# GB/s over NFS. The upload is limited by the uploader, not the array: it runs from rank 0 only,
+# one file at a time.
+#
+# This is the honest storage story for this workload:
+#   * during training, storage does not matter and the GPUs stay 99.7% busy, as they should;
+#   * the NFS checkpoint write is a short, fast burst;
+#   * the S3 upload is a serial tail. It costs real GPU time, and it has about 7x headroom left.
+#
+# Do not build this dashboard around peak throughput. A throughput panel is flat and near zero
+# for about 110 of the 136 minutes. That reads as "this 4.6 PB array does nothing". The real
+# claim is GPU time lost to storage. That is the cost that matters, and panel 2 measures it.
+# ------------------------------------------------------------------------------------------------
+#
+# Apply:  oc apply -f training-run-console-dashboard.yaml
+# Verify: OCP console > Observe > Dashboards > "AI Training Run (FBDA pipeline)"
+#
+# ------------------------------------------------------------------------------------------------
+# WHAT THE OCP CONSOLE ACTUALLY RENDERS. This reflects actual browser-rendered behavior, not
+# documentation.
+#
+# The console is not Grafana. It supports only a small part of the dashboard schema. Anything
+# outside that part is dropped with no warning: no error, no placeholder, no console log. Because
+# that silent drop is the exact problem this dashboard exists to catch, the supported part is
+# written down here. This applies to the shipped monitoring-plugin bundle, v6.0.6 / OCP 4.18.37:
+#
+#   panel.type   Only gauge, grafana-piechart-panel, graph, singlestat, table, and row work.
+#                Anything else renders nothing. `text` panels do NOT work — see the note below
+#                on the deleted "How to read this" panel.
+#   layout       Uses `span` (Grafana v4, 12 columns) or `breakpoint`. `gridPos` is not used at
+#                all. A panel with no `span` renders at full width (the 12-wide default).
+#                span 6 gives 2 panels per row, span 4 gives 3, span 3 gives 4.
+#   yaxes        Only `yaxes[0].format` is read. `yaxes[1]` is ignored, so there is no second
+#                Y axis. A series meant for a "right axis" is drawn on the left one instead.
+#                Supported formats: percentunit, bytes, Bps, pps, ms, s. Other formats (ops,
+#                kwatth, decmbytes, short) fall back to a plain humanised number. This is
+#                cosmetic, so those formats stay as-is below, for compatibility with Grafana.
+#   templating   Only the `query` and `interval` types work. `label_values(m, l)` is rewritten
+#                to `count(m) by (l)` and run as a range query. See the $namespace note below.
+#   time         Ignored. See the header above: the console owns the time range.
+#
+# THE $namespace VARIABLE NEEDS TWO KEYS. Without both, it silently defaults to the wrong
+# namespace and gives no control to change it.
+#   `hide: 0`   Makes the dropdown appear, so a person can change the namespace.
+#   `options`   With `selected: true`, sets the initial value. The plugin reads the initial
+#               value from the `namespace` URL parameter first, then `options[].selected`,
+#               then `options[0]` (the first namespace alphabetically). It does NOT read
+#               `current` — that key belongs to Grafana, and the console ignores it. Keep
+#               `current` only for Grafana compatibility. Once real label values load, a
+#               value already in that list is kept, so `ml-training` survives the refresh.
+#
+# THIS CONSOLE DOES NOT SUPPORT `text` PANELS. A `text`-type panel holding the reading guide
+# below renders as nothing: no card, no error, no panel-list entry. The guide lives here as
+# prose instead. Its key points are folded into the panel titles below, which do render.
+#
+#   A RUN HAS FOUR PHASES:
+#     1. Model load: disk write is high, GPU engine is at 0, framebuffer is filling.
+#     2. Training: engine is about 1.0, framebuffer is flat, node RX is about 3 GB/s of NCCL.
+#     3. Checkpoint: volume used steps up, NFS write ops spike.
+#     4. Upload: engine is at 0 while S3 drains.
+#
+#   THE PANEL THAT MATTERS MOST IS "GPU engine active". Storage being idle during training is
+#   correct: the GPUs are busy. The cost of storage is the width of the dip at the end, when all
+#   8 GPUs wait for the checkpoint upload. That dip is typically about 7 minutes (about 56
+#   GPU-minutes) at about 940 MB/s, on an array that wrote the same checkpoint over NFS at
+#   6.9 GB/s moments earlier. That gap comes from uploader concurrency, not the array.
+#
+#   VOLUME PANELS USE `max by (persistentvolumeclaim)`, NEVER `avg`. Kubelet polls statfs
+#   separately per node, and values can disagree mid-write. An average would show a
+#   half-written checkpoint instead of the real value.
+#
+# PANEL 4's TWO SERIES SHARE ONE AXIS ON PURPOSE. The console has no right axis — `yaxes[1]`
+# is never read. The framebuffer series is multiplied to bytes, and the shared axis is set to
+# `bytes`. This is correct for the framebuffer, and off by a "per second" for the disk-write
+# rate — the least-wrong choice on one shared axis. The two values stay within one order of
+# magnitude (1.7 GB/s vs 10.2 GiB), so both curves stay visible.
+#
+# LAYOUT. Every panel below sets `span: 6`, which the console uses for its two-up grid — a
+# panel with no `span` renders at full width in one column instead. The console ignores
+# `gridPos` entirely; it stays alongside `span` only for Grafana compatibility.
+# ------------------------------------------------------------------------------------------------
+# PANELS 10/11. `ray_training_global_step` and `ray_training_steps_completed_total` (see
+# train/train_qwen3_deepspeed.py's "Run telemetry" header) reach Prometheus. These two panels
+# turn the GPU-engine-idle proxy in panel 2 into a direct proof: the actual training-step
+# counter, on the same graph as a storage-I/O series, so a reader sees one flat window instead
+# of two panels to align by eye.
+#
+# WHY NFS WRITE OPS, NOT CHECKPOINT-VOLUME BYTES. This dashboard has one Y axis (see the yaxes
+# note above). `ray_training_global_step` ranges 0-15 for this workload (see the unit note below).
+# Checkpoint-volume bytes range over 10^11 — six orders of magnitude off, unreadable on one axis.
+# NFS write ops/s can peak around 13,178 (see the finding block above) — four orders of
+# magnitude off, still too wide. Panel 10 divides NFS write ops/s by 1000, the same
+# "least-wrong shared axis" tradeoff panel 4 already makes for its own two series: the scaled
+# series lands in the same range as global_step (peaked around 13, against a max of 15), so a
+# viewer can see the step line stop climbing at the same moment the (scaled) ops line spikes. The
+# legend says "÷ 1000" for exactly this reason — nothing here claims the raw value. Actual peak
+# values vary by hardware and workload, so re-check this divisor against real traffic if NFS
+# write-ops throughput differs meaningfully from the value used here.
+#
+# WHY THE THROUGHPUT PANEL USES A 15m RATE WINDOW, NOT 5m. This panel queries
+# `ray_training_steps_completed_total`, the raw micro-batch loop counter — NOT `global_step`,
+# which is DeepSpeed's *optimizer*-step counter and increments only once every
+# `gradient_accumulation_steps` (4) micro-batches (see train_qwen3_deepspeed.py's own comment on
+# the difference). `ray_training_steps_completed_total` increments four times more often than
+# that: about once every 1.8 minutes for a 60-micro-batch run spread over ~110 minutes of
+# training. A 5m rate window spans only about 2-3 real increments — still thin enough to read as
+# aliasing against the sampling interval rather than a stable throughput measurement. 15m was
+# chosen because it comfortably spans 8 or so real increments for most of the run, which is
+# enough for the rate to settle instead of stair-stepping between samples.
+# ------------------------------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-training-run-dashboard
+  namespace: openshift-config-managed
+  labels:
+    console.openshift.io/dashboard: "true"
+data:
+  ai-training-run-dashboard.json: |
+    {
+      "title": "AI Training Run (FBDA pipeline)",
+      "editable": false,
+      "schemaVersion": 16,
+      "timezone": "browser",
+      "refresh": "30s",
+      "time": {
+        "from": "now-3h",
+        "to": "now"
+      },
+      "templating": {
+        "list": [
+          {
+            "name": "namespace",
+            "type": "query",
+            "datasource": "prometheus",
+            "query": "label_values(kube_pod_status_phase, namespace)",
+            "refresh": 1,
+            "includeAll": false,
+            "multi": false,
+            "hide": 0,
+            "options": [
+              {
+                "text": "ml-training",
+                "value": "ml-training",
+                "selected": true
+              }
+            ],
+            "current": {
+              "text": "ml-training",
+              "value": "ml-training"
+            }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 2,
+          "type": "graph",
+          "title": "GPU engine active \u2014 the storage cost of a run is the width of the dip",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 5
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "percentunit",
+              "min": 0,
+              "max": 1
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "avg(DCGM_FI_PROF_GR_ENGINE_ACTIVE)",
+              "legendFormat": "engine active (all GPUs)"
+            },
+            {
+              "expr": "avg(DCGM_FI_DEV_GPU_UTIL) / 100",
+              "legendFormat": "GPU_UTIL (for contrast \u2014 reads 100% in an NCCL wait)"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 3,
+          "type": "graph",
+          "title": "Checkpoint volume \u2014 used vs available (max across nodes)",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 5
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "bytes",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "max by (persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace=\"$namespace\"})",
+              "legendFormat": "{{persistentvolumeclaim}} used"
+            },
+            {
+              "expr": "max by (persistentvolumeclaim) (kubelet_volume_stats_available_bytes{namespace=\"$namespace\"})",
+              "legendFormat": "{{persistentvolumeclaim}} available"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 10,
+          "type": "graph",
+          "title": "Training step counter \u2014 flat exactly where the array absorbs the checkpoint write",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 14
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "short",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "ray_training_global_step",
+              "legendFormat": "global_step (DeepSpeed optimizer step, rank 0, run_id={{run_id}})"
+            },
+            {
+              "expr": "sum(rate(node_nfs_requests_total{proto=\"4\",method=\"Write\"}[5m])) / 1000",
+              "legendFormat": "NFS write ops/s \u00f7 1000 (see \"NFS operations\" panel for true scale)"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 11,
+          "type": "graph",
+          "title": "Training throughput \u2014 optimizer steps per second",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 14
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "short",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "rate(ray_training_steps_completed_total[15m]) / 4",
+              "legendFormat": "optimizer steps/sec (run_id={{run_id}}) — ÷ 4 for gradient_accumulation_steps"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 4,
+          "type": "graph",
+          "title": "Model load signature \u2014 node disk write vs GPU framebuffer",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 23
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "bytes",
+              "min": 0
+            },
+            {
+              "format": "decmbytes"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "sum(rate(node_disk_written_bytes_total[5m]))",
+              "legendFormat": "node disk write (bytes/s)"
+            },
+            {
+              "expr": "avg(DCGM_FI_DEV_FB_USED) * 1048576",
+              "legendFormat": "GPU framebuffer used (bytes)"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 5,
+          "type": "graph",
+          "title": "NFS operations to the array (per second, NFSv4)",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 23
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "ops",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "sum(rate(node_nfs_requests_total{proto=\"4\",method=\"Write\"}[5m]))",
+              "legendFormat": "write ops/s"
+            },
+            {
+              "expr": "sum(rate(node_nfs_requests_total{proto=\"4\",method=\"Read\"}[5m]))",
+              "legendFormat": "read ops/s"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 6,
+          "type": "graph",
+          "title": "Node network receive \u2014 NCCL all-gather traffic",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 31
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "Bps",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "sum by (instance) (rate(node_network_receive_bytes_total{device!~\"lo|veth.*|br.*\"}[5m]))",
+              "legendFormat": "{{instance}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 7,
+          "type": "graph",
+          "title": "Run state \u2014 pods by phase",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 31
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "short",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "sum by (phase) (kube_pod_status_phase{namespace=\"$namespace\"})",
+              "legendFormat": "{{phase}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 8,
+          "type": "graph",
+          "title": "Containers waiting on configuration (missing Secret/ConfigMap, image pull)",
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 39
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "short",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "sum by (reason) (kube_pod_container_status_waiting_reason{namespace=\"$namespace\"})",
+              "legendFormat": "{{reason}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 9,
+          "type": "graph",
+          "title": "GPU energy consumed (kWh, cumulative per card)",
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 39
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "kwatth",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION / 3600000000",
+              "legendFormat": "{{Hostname}} gpu{{gpu}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        }
+      ]
+    }

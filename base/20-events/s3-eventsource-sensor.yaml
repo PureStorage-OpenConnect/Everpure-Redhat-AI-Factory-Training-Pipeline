@@ -1,0 +1,745 @@
+# This file is one half of one feature. The other half is:
+#   base/30-pipeline/s3-sensor-rbac.yaml (Role + RoleBinding)
+# Apply both halves together. If you apply only one, the S3 trigger loop does not work.
+#
+# This file has an S3-poll trigger loop: a webhook EventSource and a Sensor.
+#
+# This uses a webhook instead of the built-in S3 EventSource, because FlashBlade 4.5.5 does
+# not support S3 push notifications. The poller CronJob
+# (base/30-pipeline/s3-poller-cronjob.yaml) polls the bucket instead, removes duplicate
+# objects by etag, and sends each new object to this webhook.
+#
+# The Sensor's trigger creates a RayJob in the ml-training namespace for each new object.
+# This starts a GPU fine-tune job that deletes its own RayCluster when it finishes.
+#
+# CROSS-NAMESPACE ACCESS: the trigger runs as the s3-sensor service account, in this
+# namespace (argo-events), but it creates the RayJob in a different namespace
+# (ml-training). This needs a Role and a RoleBinding in ml-training that let this service
+# account create, get, and list RayJobs. The source object's key, etag, and bucket name are
+# saved as annotations on the RayJob, for lineage.
+#
+# WARNING: this pipeline can delete the evidence of a failure.
+#   - `shutdownAfterJobFinishes: true` removes the RayCluster once the job ends.
+#   - `ttlSecondsAfterFinished` sets the delay before that removal. It does NOT remove the
+#     RayJob object itself.
+#   - There is no log aggregation on this cluster, and `oc logs` cannot read a deleted pod.
+#     Once the RayCluster is removed, you cannot read the logs of that run.
+#
+# Preemption uses the same delete path as a normal finish: Kueue preempts a RayJob by
+# setting `spec.suspend: true`, and this makes KubeRay delete the RayCluster and the
+# submitter Job the same way. A preempted run loses its evidence at an unplanned moment.
+#
+# The only thing that survives both a finish and a preemption is a file on the shared RWX
+# PVC. The head and worker containers below do NOT mount `fbda-shared` a second time at
+# /tmp/ray: mounting it there makes OpenShift recursively chown the whole (multi-hundred-GB)
+# volume on every pod mount, evicting every pod before training starts. Instead, /tmp/ray
+# mounts a pod-local, non-persistent `ray-tmp` emptyDir, and a `ray-log-shipper` sidecar
+# container copies only the small `logs` subdirectory out to `fbda-shared` every 30 seconds
+# and on shutdown. See the head container below (search "RAY LOG PERSISTENCE") for the full
+# explanation and the measured numbers.
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: s3-poll
+  namespace: argo-events
+spec:
+  eventBusName: default
+  service:
+    ports:
+      - port: 12000
+        targetPort: 12000
+  webhook:
+    new-dataset-object:
+      endpoint: /s3
+      method: POST
+      port: "12000"
+---
+# This is the dedicated service account for the Sensor's trigger, in the argo-events
+# namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: s3-sensor
+  namespace: argo-events
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: s3-new-object
+  namespace: argo-events
+spec:
+  eventBusName: default
+  template:
+    serviceAccountName: s3-sensor
+  dependencies:
+    - name: dep-s3
+      eventSourceName: s3-poll
+      eventName: new-dataset-object
+  triggers:
+    - template:
+        name: pipeline-run
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: ray.io/v1
+              kind: RayJob
+              metadata:
+                generateName: qwen3-fbda-auto-
+                namespace: ml-training
+                labels:
+                  kueue.x-k8s.io/queue-name: ml-training-lq
+                  app.kubernetes.io/part-of: ckpt-training-pipeline
+                  trigger: s3-new-object
+                  # The parameters block below overwrites this value for each event. This is
+                  # for lineage only. It is not the source of RUN_ID.
+                  #
+                  # This literal is here so the key is readable in this file. Argo Events
+                  # creates a missing key automatically, so this line is not required for the
+                  # parameter to work.
+                  ckpt-run-id: "unset"
+                annotations:
+                  # Lineage: this annotation shows which object started the run. The
+                  # parameters block below sets the value from the event.
+                  ckpt-pipeline-source-key: "PLACEHOLDER"
+                  ckpt-pipeline-source-etag: "PLACEHOLDER"
+                  ckpt-pipeline-source-bucket: "PLACEHOLDER"
+              spec:
+                entrypoint: python -c "import train_qwen3_deepspeed as m; m.main()"
+                shutdownAfterJobFinishes: true
+                # WARNING: this value holds 8 GPUs idle for its whole duration. It is not an
+                # "evidence window".
+                #
+                # `shutdownAfterJobFinishes` deletes the RayCluster after this delay ends. The
+                # RayCluster has 1 head pod and 8 GPU worker pods. They stay Running and keep
+                # their GPUs for the whole delay.
+                #
+                # This field does NOT delete the RayJob object. Raising this value does not
+                # keep the RayJob status, failure message, or lineage annotation. Use
+                # `deletionPolicy` instead, to control the RayJob object's own lifetime.
+                #
+                # The value 600 gives KubeRay time to write the final job status before the
+                # RayCluster disappears. Do not raise it. This RayJob asks for all 8 GPUs in
+                # the ClusterQueue's GPU quota. Kueue frees that quota as soon as the RayJob
+                # completes, so the next run starts at once. Its workers then wait for GPUs
+                # the finished run still holds, for the length of this delay. A larger value
+                # here idles the whole GPU budget after the job is already done.
+                #
+                # This field does not save pod logs. Pods are deleted no matter what this
+                # value is. Use the /tmp/ray mount below to keep logs.
+                ttlSecondsAfterFinished: 600
+                # This is a hard limit. It stops a hung run from holding 8 GPUs forever.
+                #
+                # Measured runs took 123 and 136 minutes with the current settings
+                # (MAX_STEPS=60). The last 10 minutes of a run write the checkpoint, upload
+                # about 366 GiB (~393 GB), and free local space. A limit set too close to the run time
+                # can kill a run during this final step and lose its output.
+                #
+                # 14400 seconds (4 hours) keeps the hard limit, with room above the measured
+                # run time.
+                activeDeadlineSeconds: 14400
+                # activeDeadlineSeconds above cannot tell "training for 4 hours" from "never
+                # started". A run that never starts — for example a cordoned GPU node, a
+                # stuck image pull, or GPU resources that are never free — waits the full
+                # 14400 seconds before it is killed. Both cases get the same generic kill
+                # message.
+                #
+                # DO NOT ADD `preRunningDeadlineSeconds` HERE. This field does not exist in
+                # the RayJob CRD installed on this cluster. Kubernetes silently removes
+                # fields that are not in the CRD schema, so adding it here does nothing.
+                # `oc get rayjob -o yaml` will not show it, and the manifest applies with no
+                # error — but there is no protection.
+                #
+                # Check before you add it: run
+                # `oc explain rayjob.spec.preRunningDeadlineSeconds` on the target cluster. If
+                # the field exists there, nothing in this repository schema-validates a RayJob
+                # against your cluster's installed CRD version — it ships no CRD schemas for
+                # kubeconform (see the Makefile's own note on skipped CRD kinds). A typo or a
+                # version-mismatched field name would apply cleanly and silently do nothing, so
+                # verify it manually against a live RayJob after adding it.
+                #
+                # Where this protection lives instead, because it cannot live here:
+                #   - Alert `FbdaPodPendingTooLong`, in
+                #     base/30-pipeline/pipeline-alerts-prometheusrule.yaml. It fires after 45
+                #     minutes Pending. It cannot kill the run, but it raises an alert.
+                #   - Kueue's `waitForPodsReady` setting, in the Kueue Configuration
+                #     ConfigMap (owned by the RHOAI operator, not this repository). On this
+                #     cluster it is set to `enable: true, blockAdmission: false`.
+                #
+                # PACKAGE VERSIONS BELOW ARE PINNED ON PURPOSE. Do not remove the pins. An
+                # unpinned package resolves against PyPI at pod start-up, so a later upstream
+                # release can silently change training results between runs. The pinned
+                # versions are the ones this pipeline is validated against.
+                #
+                # torch and torchvision are pinned directly below, replacing the base image's
+                # own build and bringing a new set of CUDA packages with them. A version pin on
+                # another package here (transformers, accelerate) can still shift what pip
+                # resolves for torch/torchvision if you're not careful — check the resolved
+                # versions if you change any pin here.
+                #
+                # THESE VERSIONS MUST MATCH IN FOUR FILES: this file, and the three other
+                # manifests that declare the same pip set. Nothing checks these four files
+                # against each other automatically. If you change one, change all four in the
+                # same commit.
+                runtimeEnvYAML: |
+                  working_dir: /home/ray/train_job
+                  pip:
+                    - deepspeed==0.19.5
+                    - transformers==5.15.0
+                    - accelerate==1.14.0
+                    - torch==2.13.0
+                    - torchvision==0.28.0
+                    - nvidia-nccl-cu12==2.29.7
+                    - mlflow-skinny==3.15.1
+                  pip_check: false
+                  env_vars:
+                    LD_LIBRARY_PATH: /usr/lib64
+                    # Ray 2.52 switched its metrics backend to OpenTelemetry by default. When
+                    # RAY_USE_TLS is set (this cluster's KubeRay operator injects it via a
+                    # create-cert init container on every Ray pod), the OTEL exporter does not
+                    # pick up the TLS credentials needed to reach the dashboard agent's now-TLS
+                    # gRPC server, so metric export fails — matches
+                    # https://github.com/ray-project/ray/issues/59968 exactly, including the
+                    # affected version range (2.52+) this file pins. With RAY_USE_TLS set and
+                    # this variable unset, a GPU worker pod's own /metrics endpoint shows zero
+                    # ray_* series of any kind — not just the custom ray_training_* ones — while
+                    # its dashboard-agent log fills with "SSL_ERROR_SSL: ... WRONG_VERSION_NUMBER:
+                    # Invalid certificate verification context". Setting this reverts to the
+                    # legacy (pre-OTEL) metrics backend, which has no such TLS dependency, and
+                    # the same pod's endpoint then correctly shows ray_training_global_step,
+                    # ray_training_total_steps and ray_training_steps_completed_total.
+                    RAY_enable_open_telemetry: "false"
+                    # DO NOT set S3_DATA_BUCKET here. Values set here override the container
+                    # environment, so this would override the value the worker container
+                    # below gets from the `pipeline-config` ConfigMap.
+                    #
+                    # RUN_ID and CKPT_DIR are not set here, for the same reason. They come from
+                    # the `ckpt-run-id` pod label and the `RUN_ID` downward-API env var on the
+                    # head and worker containers below. The training code builds CKPT_DIR and
+                    # the S3 prefix from RUN_ID. If you set RUN_ID or CKPT_DIR here, every run
+                    # writes to the same checkpoint directory and S3 prefix, and destroys the
+                    # previous run's checkpoint. Do not add them here.
+                    MAX_STEPS: "60"
+                    NUM_WORKERS: "8"
+                    RAY_TRAIN_WORKER_GROUP_START_TIMEOUT_S: "600"
+                submitterPodTemplate:
+                  spec:
+                    restartPolicy: Never
+                    containers:
+                      - name: ray-job-submitter
+                        image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+                        resources:
+                          requests: {cpu: "500m", memory: 1Gi}
+                          limits: {cpu: "1", memory: 2Gi}
+                        volumeMounts:
+                          - name: train-code
+                            mountPath: /home/ray/train_job
+                    volumes:
+                      - name: train-code
+                        configMap:
+                          name: train-code
+                rayClusterSpec:
+                  rayVersion: "2.52.1"
+                  headGroupSpec:
+                    rayStartParams:
+                      dashboard-host: "0.0.0.0"
+                      num-cpus: "0"
+                      # This value must match the port scraped by the PodMonitor in
+                      # base/30-pipeline/podmonitor-ray-metrics.yaml. If they do not match, the
+                      # PodMonitor applies with no error, but collects no metrics.
+                      #
+                      # KubeRay sets this same port (8080) by default when the field is absent,
+                      # for both head and worker nodes. This line does not change that
+                      # behavior. It documents the scrape contract directly in this file.
+                      metrics-export-port: "8080"
+                    template:
+                      spec:
+                        securityContext:
+                          # DO NOT set fsGroup here. OpenShift's restricted-v2 SCC sets it from
+                          # the namespace's group range, and setting it here would conflict
+                          # with that.
+                          #
+                          # This line changes how the kubelet checks the volume before mount:
+                          #   - Default (`Always`): the kubelet changes owner and permissions
+                          #     on every file in the volume, on every pod mount.
+                          #   - `OnRootMismatch`: the kubelet checks only the volume's root
+                          #     directory — its group, its permission bits, and its setgid
+                          #     bit. If all three are already correct, it skips the full walk.
+                          #
+                          # This only works if the root directory is already set correctly.
+                          # The full walk sets the root directory last, so an interrupted walk
+                          # does not set the root, and `OnRootMismatch` cannot fix the volume on
+                          # its own the first time.
+                          #
+                          # After one full chown completes, the volume root has the correct
+                          # group and the setgid bit, and keeps the setgid bit after a large
+                          # delete. FlashBlade keeps the setgid bit; not every NFS server does.
+                          #
+                          # If a fresh volume mounts slowly again, run one full chown outside
+                          # Kueue first. Do not revert this setting to `Always`.
+                          fsGroupChangePolicy: OnRootMismatch
+                        nodeSelector:
+                          nvidia.com/gpu.present: "true"
+                        containers:
+                        - name: ray-head
+                          image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+                          resources:
+                            requests: {cpu: "2", memory: 24Gi}
+                            limits: {cpu: "2", memory: 24Gi}
+                          env:
+                          # The Ray driver runs on the head. It reads RUN_ID at import time for
+                          # RunConfig(name=...). See the worker container below for why this
+                          # uses a pod label instead of an event value.
+                          - name: RUN_ID
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.labels['ray.io/cluster']
+                          # This is the second part of the log path built by subPathExpr below.
+                          # RUN_ID is unique per run. POD_NAME is unique per pod. The mount
+                          # needs both.
+                          - name: POD_NAME
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.name
+                          # NCCL watchdog. See the worker container below for the full reason —
+                          # that is where the training collectives run. The head uses the same
+                          # settings because the driver runs here too, and joins the same
+                          # process group. Do not move these to runtimeEnvYAML — see the
+                          # precedence note there.
+                          - name: TORCH_NCCL_ENABLE_MONITORING
+                            value: "1"
+                          - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                            value: "1200"
+                          - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+                            value: "1"
+                          - name: TORCH_NCCL_TRACE_BUFFER_SIZE
+                            value: "2000"
+                          - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+                            value: "3"
+                          # By default this dump goes to /tmp/nccl_trace_rank_<rank>, which is
+                          # deleted with the pod. This path uses the persisted /tmp/ray mount
+                          # below instead. Do not add a $(VAR) here — the mount's subPathExpr
+                          # already makes the path unique per run and per pod.
+                          - name: TORCH_NCCL_DEBUG_INFO_TEMP_FILE
+                            value: /tmp/ray/nccl_trace_rank_
+                          ports:
+                          - {containerPort: 6379, name: gcs-server}
+                          - {containerPort: 8265, name: dashboard}
+                          - {containerPort: 10001, name: client}
+                          # THE SCRAPE CONTRACT. A PodMonitor's `podMetricsEndpoints[].port`
+                          # value is the NAME of a container port, not a port number. The name
+                          # below is half of the contract; the other half is in
+                          # base/30-pipeline/podmonitor-ray-metrics.yaml.
+                          #
+                          # This line is safe to keep even if KubeRay already adds this port by
+                          # default: KubeRay skips adding its own `metrics` port if one already
+                          # exists with that name. Declaring it here does not create a
+                          # duplicate or cause an error.
+                          #
+                          # Keep this line regardless. It documents the scrape contract in the
+                          # manifest, instead of relying on a default that depends on which
+                          # operator build is installed.
+                          - {containerPort: 8080, name: metrics}
+                          volumeMounts:
+                          - name: fbda-shared
+                            mountPath: /mnt/fbda
+                          # RAY LOG PERSISTENCE. Ray writes its own logs inside the pod, at
+                          # /tmp/ray: raylet.out, gcs_server.out, dashboard and agent logs, and
+                          # each worker's Python traceback log. `oc logs` shows only the
+                          # container's stdout, which is a small part of this. All of it is
+                          # lost when the pod is deleted (see the EVIDENCE RETENTION warning at
+                          # the top of this file).
+                          #
+                          # DO NOT MOUNT /tmp/ray DIRECTLY ON THE `fbda-shared` PVC. The
+                          # volume's fsGroup makes OpenShift recursively change owner and
+                          # permissions on the whole volume on every pod mount. /tmp/ray is
+                          # Ray's full session root, not just its log directory — one run puts
+                          # about 70 GB and 572,744 files there, mostly a per-pod copy of the
+                          # pip packages from `runtimeEnvYAML`. That volume size is enough to
+                          # make every pod fail to start under this chown walk.
+                          #
+                          # THE CURRENT DESIGN INSTEAD: /tmp/ray mounts a pod-local,
+                          # non-persistent `ray-tmp` volume (see below). A separate
+                          # `ray-log-shipper` container copies only the small `logs`
+                          # subdirectory (about 86 MB) to the persisted PVC every 30 seconds,
+                          # and on pod shutdown. This keeps the evidence without the
+                          # volume-mount cost.
+                          #
+                          # subPathExpr (not a fixed subPath) builds the shipped log path from
+                          # RUN_ID and POD_NAME, so every run and every pod writes to its own
+                          # directory. A fixed path here would let one run overwrite another
+                          # run's files.
+                          #
+                          # There is no file-count monitoring on this cluster's storage. Watch
+                          # the `FbdaVolumeHeadroomLow` alert for free space instead.
+                          #
+                          # The best long-term fix is still to bake the `runtimeEnvYAML` pip
+                          # packages into the container image, so there is little to ship in
+                          # the first place.
+                          - name: ray-tmp
+                            mountPath: /tmp/ray
+                        # This container copies Ray's logs from the pod-local `ray-tmp` volume
+                        # to the persisted `fbda-shared` volume, so they survive pod teardown.
+                        #
+                        # This uses the Ray image on purpose, not a log-shipping image. This
+                        # cluster has no network access to pull a new image, the Ray image is
+                        # already on every GPU node, and there is no log collector to send data
+                        # to — the only requirement is to copy files to the shared volume. Use
+                        # a different image if you add a log collector; the volume mounts do
+                        # not need to change.
+                        - name: ray-log-shipper
+                          image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+                          command: ["/bin/sh","-c"]
+                          args:
+                            - |
+                              set -u
+                              DEST="/mnt/fbda/ray-logs/${RUN_ID}/${POD_NAME}"
+                              mkdir -p "$DEST"
+                              # session_latest is a symlink. The -L flag follows it.
+                              # A glob path cannot be mounted directly. This script copies the
+                              # files instead.
+                              sync_once() {
+                                [ -d /tmp/ray/session_latest/logs ] || return 0
+                                cp -rL /tmp/ray/session_latest/logs/. "$DEST"/ 2>/dev/null || true
+                              }
+                              # Flush the logs on SIGTERM, so a normal shutdown does not lose any
+                              # log data.
+                              trap 'sync_once; exit 0' TERM INT
+                              # Print a heartbeat each cycle. Without this, a working shipper and
+                              # a stuck shipper both print nothing, and the only way to tell them
+                              # apart is to count files on the volume by hand. A file count that
+                              # stops growing shows a stuck shipper.
+                              n=0
+                              while true; do
+                                sync_once
+                                n=$((n+1))
+                                echo "[shipper] cycle=$n shipped=$(find "$DEST" -type f 2>/dev/null | wc -l) dest=$DEST"
+                                sleep 30 & wait $!
+                              done
+                          resources:
+                            requests: {cpu: "50m", memory: 128Mi}
+                            limits: {cpu: "200m", memory: 512Mi}
+                          env:
+                          - name: RUN_ID
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.labels['ray.io/cluster']
+                          - name: POD_NAME
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.name
+                          volumeMounts:
+                          - name: ray-tmp
+                            mountPath: /tmp/ray
+                            readOnly: true
+                          - name: fbda-shared
+                            mountPath: /mnt/fbda
+                        volumes:
+                        - name: fbda-shared
+                          persistentVolumeClaim:
+                            claimName: fbda-shared
+                        # This is Ray's session root: sockets, installed pip packages, and
+                        # spilled objects. It does not need to persist — only its `logs`
+                        # subdirectory does, and the shipper container copies that out.
+                        # sizeLimit covers the pip install (about 8.8 GB measured), with room
+                        # to spare. If a pod exceeds this limit, Kubernetes evicts it with a
+                        # clear reason instead of filling the node's disk.
+                        - name: ray-tmp
+                          emptyDir:
+                            sizeLimit: 30Gi
+                  workerGroupSpecs:
+                  - groupName: gpu-worker
+                    minReplicas: 8
+                    maxReplicas: 8
+                    replicas: 8
+                    rayStartParams:
+                      num-gpus: "1"
+                      # Same port and same reason as the head group above. Every Ray node runs
+                      # its own metrics agent, so each of the 8 workers is a separate scrape
+                      # target with its own per-rank metrics (GPU, object store, raylet).
+                      #
+                      # The training script's own metrics are rank-0 only, by design. Ray tags
+                      # every metric with a worker ID, so a metric set on all 8 ranks would
+                      # appear as 8 separate series, and a sum() over them would show 8 times
+                      # the real value.
+                      metrics-export-port: "8080"
+                    template:
+                      spec:
+                        securityContext:
+                          # DO NOT set fsGroup here. OpenShift's restricted-v2 SCC sets it from
+                          # the namespace's group range, and setting it here would conflict
+                          # with that.
+                          #
+                          # This line changes how the kubelet checks the volume before mount:
+                          #   - Default (`Always`): the kubelet changes owner and permissions
+                          #     on every file in the volume, on every pod mount.
+                          #   - `OnRootMismatch`: the kubelet checks only the volume's root
+                          #     directory — its group, its permission bits, and its setgid
+                          #     bit. If all three are already correct, it skips the full walk.
+                          #
+                          # This only works if the root directory is already set correctly.
+                          # The full walk sets the root directory last, so an interrupted walk
+                          # does not set the root, and `OnRootMismatch` cannot fix the volume on
+                          # its own the first time.
+                          #
+                          # After one full chown completes, the volume root has the correct
+                          # group and the setgid bit, and keeps the setgid bit after a large
+                          # delete. FlashBlade keeps the setgid bit; not every NFS server does.
+                          #
+                          # If a fresh volume mounts slowly again, run one full chown outside
+                          # Kueue first. Do not revert this setting to `Always`.
+                          fsGroupChangePolicy: OnRootMismatch
+                        nodeSelector:
+                          nvidia.com/gpu.present: "true"
+                        containers:
+                        - name: ray-worker
+                          image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+                          resources:
+                            # Qwen3-32B in safetensors is about 65 GB, downloaded to
+                            # LOCAL_MODEL_DIR (/tmp/qwen3-32b, train_qwen3_deepspeed.py) on
+                            # every worker's container writable layer, not a mounted volume.
+                            # 90Gi/100Gi covers that plus headroom.
+                            requests: {cpu: "6", memory: 180Gi, ephemeral-storage: 90Gi, nvidia.com/gpu: "1"}
+                            limits: {cpu: "6", memory: 400Gi, ephemeral-storage: 100Gi, nvidia.com/gpu: "1"}
+                          envFrom:
+                          - configMapRef:
+                              name: pipeline-config
+                          env:
+                          - name: S3_ENDPOINT
+                            valueFrom: {secretKeyRef: {name: flashblade-s3, key: S3_ENDPOINT}}
+                          - name: AWS_ACCESS_KEY_ID
+                            valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_ACCESS_KEY_ID}}
+                          - name: AWS_SECRET_ACCESS_KEY
+                            valueFrom: {secretKeyRef: {name: flashblade-s3, key: AWS_SECRET_ACCESS_KEY}}
+                          - name: MLFLOW_TRACKING_URI
+                            value: "http://mlflow.ml-training.svc.cluster.local:5000"
+                          - name: MLFLOW_EXPERIMENT
+                            value: "qwen3-fbda"
+                          # PER-RUN IDENTITY. The training code uses RUN_ID to build CKPT_DIR
+                          # and the S3 checkpoint prefix. This value reaches the Ray worker
+                          # processes as a normal container variable, and is not overridden,
+                          # because runtimeEnvYAML above does not set RUN_ID.
+                          #
+                          # This uses the `ray.io/cluster` pod label, not the event's ETag.
+                          # KubeRay sets this label on every pod, using the RayCluster name,
+                          # which is unique for every run. It does not need an Argo Events
+                          # parameter, so it cannot silently fall back to a shared value.
+                          #
+                          # An ETag identifies file content, not the run. Two different objects
+                          # with the same bytes get the same ETag, so an ETag-based ID could put
+                          # two different runs in the same checkpoint directory — the exact
+                          # problem this design avoids. The ETag is still saved, as a lineage
+                          # annotation on the RayJob.
+                          #
+                          # If this label is ever missing, the downward API returns an empty
+                          # string, not an error. The training code stops at start-up in that
+                          # case, instead of running with a shared path.
+                          - name: RUN_ID
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.labels['ray.io/cluster']
+                          # Per-pod identity, used by the log subPathExpr on the mount below.
+                          # RUN_ID separates runs; this separates the 8 workers and the head
+                          # within one run — every one of them writes a file named raylet.out.
+                          - name: POD_NAME
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.name
+                          # ------------------------------------------------------------------
+                          # NCCL WATCHDOG. This turns a wedged training step into a clear
+                          # failure.
+                          #
+                          # THE PROBLEM THIS SOLVES: if one rank dies or a network link stalls,
+                          # the other 7 ranks wait forever inside a collective operation. Every
+                          # pod stays Running and Ready. The RayJob stays Running. The only GPU
+                          # metric this cluster collects, DCGM_FI_DEV_GPU_UTIL, reads 100% for a
+                          # rank stuck waiting — it cannot tell a stuck wait from real work.
+                          # Every signal available says the run is healthy. Without this
+                          # watchdog, only activeDeadlineSeconds ends the run, 4 hours later,
+                          # with no diagnosis.
+                          #
+                          # WITH THESE SETTINGS: the monitoring thread stops the process once
+                          # the watchdog sees no progress, and saves a trace of the collective
+                          # operation that was running and which ranks never arrived.
+                          #
+                          # KEEP THESE IN `env:`. Do not move them to runtimeEnvYAML. Ray
+                          # applies `runtime_env.env_vars` on top of the container environment,
+                          # so a copy there always wins over these values, silently overriding
+                          # them with no warning.
+                          # ------------------------------------------------------------------
+                          # Starts the monitoring thread. Without it the four settings below do
+                          # nothing: the flight recorder still records, but nobody reads it.
+                          - name: TORCH_NCCL_ENABLE_MONITORING
+                            value: "1"
+                          # WHY 1200 SECONDS (20 minutes), not the default. The watchdog stops
+                          # the process after this many seconds with no progress, so the value
+                          # must be above the longest normal wait — for this workload, that is
+                          # the checkpoint write and upload step, not a training step. Measured:
+                          # the checkpoint write and its 366 GiB (~393 GB) upload take about 8 minutes
+                          # (480 seconds), during which faster ranks wait for the slowest one.
+                          # PyTorch's own default is close to this 480-600 second range, so using
+                          # the default could stop a healthy run during a normal checkpoint, and
+                          # the resulting error would look like an NCCL bug that does not exist.
+                          # 1200 seconds gives 2.5 times the measured wait, with room for a
+                          # busier storage array or a slower future checkpoint, while still
+                          # catching a real hang 3.3 hours before activeDeadlineSeconds would.
+                          #
+                          # SCOPE: this bounds a stuck watchdog only. It does not bound a single
+                          # collective operation — that timeout is set in code, in
+                          # `init_process_group(timeout=)`, and cannot be set from here.
+                          - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                            value: "1200"
+                          # Save the trace when the watchdog fires. Without this, the process
+                          # stops and the trace — the only record of which ranks were missing —
+                          # is lost with it.
+                          - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+                            value: "1"
+                          # This is a ring buffer of recent collective operations, kept per
+                          # rank. 2000 entries use a few MB of memory and cover more than one
+                          # training step, so the trace shows the events leading up to the
+                          # failure, not only the last one.
+                          - name: TORCH_NCCL_TRACE_BUFFER_SIZE
+                            value: "2000"
+                          # 3 = stop the process on an async error, and skip the normal NCCL
+                          # cleanup. This is deliberate: cleaning up an already-stuck
+                          # communicator can itself hang, which would repeat the same problem
+                          # this setting exists to avoid. KubeRay deletes the whole pod anyway,
+                          # so there is no long-running process that needs a clean NCCL
+                          # shutdown.
+                          - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+                            value: "3"
+                          # By default this trace goes to /tmp/nccl_trace_rank_<rank>, deleted
+                          # with the pod. This path uses the persisted /tmp/ray mount below, so
+                          # the trace survives.
+                          - name: TORCH_NCCL_DEBUG_INFO_TEMP_FILE
+                            value: /tmp/ray/nccl_trace_rank_
+                          # Declaring this port here documents the scrape contract in the
+                          # manifest, instead of relying on KubeRay's default port-naming
+                          # behavior. See the head container above for the full scrape-contract
+                          # note.
+                          #
+                          # Only the metrics port is declared here. A containerPort entry
+                          # documents a port; it does not block traffic on other ports. The
+                          # other ports this container listens on are left undeclared on
+                          # purpose.
+                          ports:
+                          - {containerPort: 8080, name: metrics}
+                          volumeMounts:
+                          - name: fbda-shared
+                            mountPath: /mnt/fbda
+                          # NCCL's shared-memory transport needs real /dev/shm, not the
+                          # container runtime's 64Mi default. 4Gi is not a tight floor here: a
+                          # live run of this pipeline at this size showed under 1% utilization
+                          # (33M used of 4Gi) during real training — evidence of headroom, not
+                          # a tight floor. Re-check this number if NCCL SHM usage ever looks
+                          # tight.
+                          # This must match the standalone RayJob/RayCluster manifests —
+                          # there is no automated check for this; it must be kept in sync
+                          # by hand across all five manifests (rayjob-eval-v8.yaml,
+                          # rayjob-train-ephemeral.yaml, rayjob-resume-v5.yaml,
+                          # raycluster-fbda-checkpoint.yaml, and this embedded copy).
+                          - name: dev-shm
+                            mountPath: /dev/shm
+                          # Ray log persistence. See the head container above for the full
+                          # explanation: why /tmp/ray is pod-local, why there is no log
+                          # aggregation on this cluster, and why the log path must be unique
+                          # per run and per pod. This mount also receives the
+                          # TORCH_NCCL_DEBUG_INFO_TEMP_FILE trace, written at the moment a rank
+                          # aborts, right before its pod is deleted.
+                          #
+                          # DO NOT MOUNT THIS DIRECTLY ON THE PERSISTED VOLUME. Doing so makes
+                          # OpenShift recursively change ownership on the whole volume on every
+                          # pod mount, which blocks every pod from starting. Use the pod-local
+                          # `ray-tmp` volume and the `ray-log-shipper` container instead. See the
+                          # head container above for the full explanation and the measured
+                          # numbers.
+                          - name: ray-tmp
+                            mountPath: /tmp/ray
+                        # Same log shipper as the head group. See there for why this uses a
+                        # sidecar copy instead of a copy-on-exit hook, and why it runs the Ray
+                        # image.
+                        - name: ray-log-shipper
+                          image: registry.redhat.io/rhoai/odh-pipeline-runtime-pytorch-cuda-py312-rhel9@sha256:f35ce6caacf4e34d8301f1867c67227cbafdcf76abd6588b09df7960a55ea869
+                          command: ["/bin/sh","-c"]
+                          args:
+                            - |
+                              set -u
+                              DEST="/mnt/fbda/ray-logs/${RUN_ID}/${POD_NAME}"
+                              mkdir -p "$DEST"
+                              sync_once() {
+                                [ -d /tmp/ray/session_latest/logs ] || return 0
+                                cp -rL /tmp/ray/session_latest/logs/. "$DEST"/ 2>/dev/null || true
+                                # TORCH_NCCL_DEBUG_INFO_TEMP_FILE is not saved in the logs
+                                # directory, so this loop copies it directly. It is written right
+                                # before a rank aborts, just before its pod is deleted.
+                                for f in /tmp/ray/nccl_trace_rank_* /tmp/ray/session_latest/nccl_trace_rank_*; do
+                                  [ -e "$f" ] && cp -L "$f" "$DEST"/ 2>/dev/null || true
+                                done
+                              }
+                              trap 'sync_once; exit 0' TERM INT
+                              # Print a heartbeat each cycle. Without this, a working shipper and
+                              # a stuck shipper both print nothing, and the only way to tell them
+                              # apart is to count files on the volume by hand. A file count that
+                              # stops growing shows a stuck shipper.
+                              n=0
+                              while true; do
+                                sync_once
+                                n=$((n+1))
+                                echo "[shipper] cycle=$n shipped=$(find "$DEST" -type f 2>/dev/null | wc -l) dest=$DEST"
+                                sleep 30 & wait $!
+                              done
+                          resources:
+                            requests: {cpu: "50m", memory: 128Mi}
+                            limits: {cpu: "200m", memory: 512Mi}
+                          env:
+                          - name: RUN_ID
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.labels['ray.io/cluster']
+                          - name: POD_NAME
+                            valueFrom:
+                              fieldRef:
+                                fieldPath: metadata.name
+                          volumeMounts:
+                          - name: ray-tmp
+                            mountPath: /tmp/ray
+                            readOnly: true
+                          - name: fbda-shared
+                            mountPath: /mnt/fbda
+                        volumes:
+                        - name: ray-tmp
+                          emptyDir:
+                            sizeLimit: 30Gi
+                        - name: fbda-shared
+                          persistentVolumeClaim:
+                            claimName: fbda-shared
+                        - name: dev-shm
+                          emptyDir:
+                            medium: Memory
+                            sizeLimit: 4Gi
+          parameters:
+            - src:
+                dependencyName: dep-s3
+                dataKey: body.key
+              dest: metadata.annotations.ckpt-pipeline-source-key
+            # Lineage only. This label records which object started the run, so you can find
+            # it with `oc get rayjob -l ckpt-run-id=...`. RUN_ID does NOT come from here — it
+            # comes from the `ray.io/cluster` pod label (see the worker container above), so
+            # run identity never depends on this parameter resolving.
+            #
+            # `dependencyName` must be `dep-s3` — the name declared under `dependencies:`
+            # above, not the Sensor's own name. If it names a dependency that does not exist,
+            # the value silently stays at its default, with no error and no event.
+            - src:
+                dependencyName: dep-s3
+                dataKey: body.etag
+              dest: metadata.labels.ckpt-run-id
+            - src:
+                dependencyName: dep-s3
+                dataKey: body.etag
+              dest: metadata.annotations.ckpt-pipeline-source-etag
+            - src:
+                dependencyName: dep-s3
+                dataKey: body.bucket
+              dest: metadata.annotations.ckpt-pipeline-source-bucket
+

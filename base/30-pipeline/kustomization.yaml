@@ -1,0 +1,47 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Phase 30 — the application. This is the only phase where the customer chooses the namespace.
+#
+# No resource here sets metadata.namespace. The overlay supplies the namespace
+# (`namespace:` in overlays/<env>/30-pipeline/kustomization.yaml). This makes the base
+# reusable. Do not add metadata.namespace back into these files.
+#
+# Cross-namespace references stay explicit: s3-sensor-rbac.yaml binds a ServiceAccount
+# that lives in argo-events.
+#
+# Observability manifests ship here, next to the workload they watch, the same choice
+# used for base/00-platform/dcgm-console-dashboard.yaml. Keep alerting close to the
+# workload it describes, not in a separate repository.
+#
+# WARNING: volumesnapshot-ckpt.yaml is deliberately not in the resources list below.
+# It snapshots `fbda-shared`. If applied at install time, it snapshots a volume that
+# was just provisioned and is empty. The snapshot still reports `readyToUse: true`,
+# and a PVC restored from it comes up Bound but holds nothing. Apply this file only
+# after a run has written a checkpoint:
+#
+#   oc -n ml-training apply -f volumesnapshot-ckpt.yaml
+#
+# An automated run reclaims its local checkpoint at the end. So "after a run" means
+# after a run that kept its checkpoint (KEEP_LOCAL_CKPT=1), or before the reclaim
+# step runs. See that file's header for the full detail.
+#
+# WARNING: rollback-revert-from-snapshot.yaml is also deliberately not in the list
+# below, for a stronger reason. It is the PVC that reverts fbda-shared from a snapshot
+# and discards everything written since. Apply it only by hand, never as part of a
+# routine install. See docs/rollback-runbook.md before you use it.
+resources:
+  - localqueue.yaml
+  - mlflow-server.yaml
+  - model-staging-job.yaml
+  - namespace.yaml
+  - networkpolicy-ray-metrics-scrape.yaml
+  - pipeline-alerts-prometheusrule.yaml
+  - pipeline-canary-cronjob.yaml
+  - pipeline-config.yaml
+  - podmonitor-ray-metrics.yaml
+  - pvc-fbda-shared.yaml
+  - s3-poller-cronjob.yaml
+  - s3-sensor-rbac.yaml
+  - snapshot-agent-rbac.yaml
+  - train-code-configmap.yaml

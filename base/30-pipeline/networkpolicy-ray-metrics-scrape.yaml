@@ -1,0 +1,42 @@
+# This NetworkPolicy lets user-workload Prometheus reach the Ray metrics port.
+#
+# WARNING: without this policy, podmonitor-ray-metrics.yaml does not work. The target shows
+# `health=down` with `context deadline exceeded`, and no error or warning appears. Check the
+# target's health under its real job name, `<namespace>/ray-metrics`, not `ray-metrics`.
+#
+# WHY THIS IS NEEDED. KubeRay creates one NetworkPolicy for each RayCluster. That policy
+# allows traffic only from the `openshift-monitoring` namespace, the platform monitoring
+# stack. A PodMonitor in an application namespace is scraped by user-workload monitoring
+# instead, which runs in `openshift-user-workload-monitoring`. That namespace is not in the
+# allow-list, so the network layer drops the scrape traffic.
+#
+# NetworkPolicy rules are additive: the effective permission is the union of every policy
+# that selects a pod. This policy adds the one missing rule. Do not edit or patch the
+# operator's policy. KubeRay recreates it for each RayCluster and would overwrite the edit.
+#
+# The selector matches every RayCluster head and worker pod in the namespace, including
+# RayClusters KubeRay has not created yet. The port is the metrics port KubeRay adds to
+# each pod; podmonitor-ray-metrics.yaml explains how this was confirmed on a live pod.
+#
+# This manifest sets no `metadata.namespace`. The overlay sets the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ray-metrics-scrape
+  labels:
+    app.kubernetes.io/part-of: fbda-observability
+spec:
+  podSelector:
+    matchExpressions:
+      - key: ray.io/cluster
+        operator: Exists
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-user-workload-monitoring
+      ports:
+        - port: 8080
+          protocol: TCP

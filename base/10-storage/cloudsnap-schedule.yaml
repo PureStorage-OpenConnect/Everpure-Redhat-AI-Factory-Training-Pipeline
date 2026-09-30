@@ -1,0 +1,33 @@
+# OPTIONAL, UNWIRED SCAFFOLDING. Neither object below is referenced by
+# base/10-storage/kustomization.yaml (see the WARNING in that file) and neither is applied by any
+# documented install path. This is an example for a customer who later wants scheduled Stork
+# cloudsnap backups — add it to your own overlay, with a real BackupLocation target, when you have
+# one. The BackupLocation below points at px-cloud-credentials (cloudsnap-credential.yaml in this
+# same directory), which is equally unwired.
+---
+apiVersion: stork.libopenstorage.org/v1alpha1
+kind: SchedulePolicy
+metadata:
+  name: fbda-backup-policy
+  annotations:
+    ml-training.example.com/status: repo-scaffold-only
+policy:
+  interval:
+    intervalMinutes: 60
+    retain: 24
+  daily:
+    time: "02:00am"
+    retain: 7
+---
+apiVersion: stork.libopenstorage.org/v1alpha1
+kind: BackupLocation
+metadata:
+  name: fbda-backup-location
+  namespace: portworx
+  annotations:
+    ml-training.example.com/status: repo-scaffold-only
+location:
+  type: s3
+  path: fbda/cloudsnap
+  secretConfig: px-cloud-credentials
+  sync: true

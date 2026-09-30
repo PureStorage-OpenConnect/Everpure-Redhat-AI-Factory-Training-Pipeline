@@ -1,0 +1,373 @@
+# Alert rules for the checkpoint-training pipeline.
+#
+# WHY THIS FILE EXISTS. Every built-in platform alert only matches namespaces
+# like `openshift-*`, `kube-*`, or `default`. It cannot match a user namespace
+# like this one, even when the metrics exist and an alert with the right name
+# exists.
+#
+# A rule that cannot match looks the same as a healthy system. This file adds
+# alerts that do match this namespace.
+#
+# DO NOT ADD A NAMESPACE MATCHER TO ANY EXPRESSION BELOW. Two reasons:
+#
+#   1. Kustomize's namespace transformer changes `metadata.namespace`, but it
+#      cannot change a string inside a CRD spec. PromQL here is a string in
+#      `spec.groups[].rules[].expr`. A namespace written into an expression
+#      survives every overlay unchanged. A customer who deploys to a
+#      different namespace would get rules that apply cleanly but silently
+#      watch the wrong namespace forever.
+#   2. It is not needed. OpenShift user-workload monitoring adds this
+#      object's own namespace as a label matcher automatically. A
+#      hand-written matcher is redundant at best and wrong at worst.
+#
+# THESE RULES CAN SEE PLATFORM METRICS. The metrics used
+# below (`kube_*` from kube-state-metrics, `kubelet_volume_stats_*` from the
+# kubelet) are collected by the platform Prometheus, not the user-workload
+# stack. On this cluster (OCP 4.18), Thanos Ruler evaluates these rules, not
+# the user-workload Prometheus. Thanos Ruler queries `thanos-querier`, which
+# reaches both platform and user metrics. So the expressions below work as
+# written.
+#
+# STILL CHECK THAT EACH EXPRESSION RETURNS DATA when a run is active. The two
+# storage rules can show no data when no pod mounts fbda-shared. This is
+# expected, not a defect. FbdaVolumeStatsAbsentWhileMounted exists to catch
+# the case when it IS a defect — a pod has the volume mounted, but the stats
+# are still missing.
+#
+# ALERT DESTINATION IS NOT CONFIGURED YET. Thanos Ruler sends alerts to the
+# platform Alertmanager, but its only receiver is a placeholder in
+# base/00-platform/alertmanager-placeholder-receiver.yaml. These alerts show
+# up in the console only; they do not notify anyone yet. The `component:
+# fbda-pipeline` label lets you attach a real route later without editing any
+# expression. Do not add an SMTP or Slack target here.
+#
+# RULE ORDER MATTERS. An overlay may patch a threshold by array index (for
+# example `/spec/groups/1/rules/0/expr`). Do not reorder existing rules. Add
+# new rules at the end of a group.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fbda-pipeline-alerts
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  groups:
+    # =========================================================================================
+    # group 0 — workload
+    # =========================================================================================
+    - name: fbda-pipeline-workload
+      rules:
+        # A Deployment that points to a Secret or ConfigMap key that does not
+        # exist leaves its pods stuck in CreateContainerConfigError.
+        # KubeContainerWaiting only matches platform namespaces, so it does
+        # not fire for this one.
+        #
+        # Use `for: 15m` because these four reasons do not clear on their
+        # own: a missing Secret or ConfigMap key never resolves itself, and a
+        # pulling image shows ContainerCreating, not ImagePullBackOff. 15
+        # minutes ignores node reboots and registry hiccups, and the pods
+        # this rule catches are already stuck by the time the timer starts.
+        - alert: FbdaContainerWaitingOnConfig
+          expr: |
+            max by (namespace, pod, container, reason) (
+              kube_pod_container_status_waiting_reason{
+                reason=~"CreateContainerConfigError|CreateContainerError|ErrImagePull|ImagePullBackOff"
+              }
+            ) > 0
+          for: 15m
+          labels:
+            severity: warning
+            component: fbda-pipeline
+          annotations:
+            summary: "Container {{ $labels.pod }}/{{ $labels.container }} stuck in {{ $labels.reason }}"
+            description: >-
+              Container {{ $labels.container }} in pod {{ $labels.pod }} (namespace
+              {{ $labels.namespace }}) has been waiting with reason {{ $labels.reason }} for 15
+              minutes. CreateContainerConfigError almost always means a referenced Secret or
+              ConfigMap key is missing — check `oc describe pod {{ $labels.pod }}`. This will not
+              clear on its own.
+
+        # The pipeline runs as Jobs: the s3-poller CronJob, the
+        # model-staging Job, the canary CronJob, and the RayJob submitter
+        # Job. Today, a failure in any of them produces no alert.
+        #
+        # `kube_job_status_failed` counts failed pod attempts. It stays
+        # above zero for the life of the Job, even after a later attempt
+        # succeeds. Alerting on it alone would page for a Job that
+        # succeeded in the end. The `unless` clause removes those cases.
+        # What remains is a Job with failed attempts and no success.
+        #
+        # Do not add a job_name matcher here for a normal CronJob or Job. A matcher here means a
+        # new CronJob ships with no alerting, and nobody notices for weeks.
+        #
+        # THE ONE EXCLUSION BELOW IS DIFFERENT. base/50-stages/eval-gate-job.yaml's
+        # eval-gate-fail Job is DESIGNED to exit 1 — it proves the gate's FAIL branch against a
+        # real, tight threshold on the real measured perplexity, and is not expected to ever
+        # succeed. Without the exclusion, applying phase 50 makes this alert fire permanently.
+        # kube_job_status_failed/kube_job_status_succeeded carry no custom labels here (this
+        # cluster does not join kube_job_labels), so job_name — which is always this Job's own
+        # metadata.name — is the only selector available to key the exclusion on. The Job and
+        # its Pod template both also carry app.kubernetes.io/component: intentional-failure-gate
+        # for human/tooling visibility; keep the job_name value below in sync with that Job's
+        # name if it is ever renamed.
+        - alert: FbdaJobFailed
+          expr: |
+            max by (namespace, job_name) (kube_job_status_failed{job_name!="eval-gate-fail"}) > 0
+            unless
+            max by (namespace, job_name) (kube_job_status_succeeded) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: fbda-pipeline
+          annotations:
+            summary: "Job {{ $labels.job_name }} has failed attempts and no success"
+            description: >-
+              Job {{ $labels.job_name }} in namespace {{ $labels.namespace }} has at least one
+              failed pod and has not succeeded. For s3-poller this includes an unreachable or
+              nonexistent bucket — a non-zero exit is the only bucket-reachable
+              signal available without a Pushgateway. eval-gate-fail is excluded by
+              name: it is designed to fail (see base/50-stages/eval-gate-job.yaml), and this
+              alert is not the right instrument to detect a designed failure.
+
+        # The canary's staleness alert. See pipeline-canary-cronjob.yaml for
+        # why a canary is the only instrument that can see the full chain:
+        # S3, poller, Sensor, RayJob. Argo Events has no counter for events
+        # received or filtered, and a trigger with a missing dependency is
+        # skipped silently while still reporting success. Only a canary that
+        # stops arriving can show this.
+        #
+        # THE SHIPPED CANARY DOES NOT COVER THE WHOLE CHAIN. It defaults to
+        # ASSERT_RAYJOB=false, so stage 2 (checking that a RayJob appeared
+        # with the canary's key) is skipped. As shipped, this alert covers
+        # only S3 -> poller -> EventSource. It does NOT detect a Sensor that
+        # accepts an event and does nothing with it. Turn on ASSERT_RAYJOB
+        # only together with adding a data filter to the Sensor. Until then,
+        # a green canary only confirms the first three links.
+        #
+        # THE SUSPEND GUARD IS REQUIRED, NOT OPTIONAL. The canary ships
+        # suspended because it launches a real 8-GPU training run each time
+        # it fires. Without the guard, this alert fires continuously on any
+        # cluster that has not enabled the canary. A constantly firing
+        # alert gets ignored, including the one alert meant to catch the
+        # failure above. `kube_cronjob_spec_suspend == 0` means the
+        # operator turned the canary on.
+        #
+        # 8 hours against a 6-hour schedule catches the first missed run.
+        # There are two branches because a canary that has never succeeded
+        # produces no completion_time data at all, so a plain comparison
+        # cannot fire on missing data. The canary Jobs keep no
+        # ttlSecondsAfterFinished on purpose: the retained Job is the
+        # evidence. Deleting it would hide the failure.
+        - alert: FbdaCanaryStale
+          expr: |
+            (
+              (time() - max by (namespace) (kube_job_status_completion_time{job_name=~"pipeline-canary-.*"})) > 8 * 3600
+              and on (namespace) (kube_cronjob_spec_suspend{cronjob="pipeline-canary"} == 0)
+            )
+            or
+            (
+              absent(kube_job_status_completion_time{job_name=~"pipeline-canary-.*"})
+              and on () (count(kube_cronjob_spec_suspend{cronjob="pipeline-canary"} == 0) > 0)
+            )
+          for: 10m
+          labels:
+            severity: warning
+            component: fbda-pipeline
+          annotations:
+            summary: "End-to-end pipeline canary has not completed successfully in 8h"
+            description: >-
+              The canary is enabled (CronJob not suspended) but no pipeline-canary Job has
+              completed successfully within 8 hours. Check the most recent pipeline-canary Job's
+              logs: it names the stage that timed out. Note the coverage depends on
+              ASSERT_RAYJOB — false (the shipped default) means only S3 -> poller -> EventSource
+              was ever asserted, and a Sensor that accepts an event and silently does nothing with
+              it is NOT detected. Nothing else in this stack can detect that, so turn
+              ASSERT_RAYJOB on once the Sensor has a data filter.
+
+        # THE GANG THAT NEVER FORMS. A RayJob whose worker pods never reach
+        # Running — a cordoned GPU node, a stuck image pull, or a placement
+        # group that can never be satisfied — burns the whole
+        # activeDeadlineSeconds (14400 seconds, 4 hours) and is then killed
+        # with the same generic message as a real 4-hour overrun. Nothing
+        # tells them apart. The head log says "infeasible resource
+        # requests", which also appears during normal scale-up and means
+        # nothing on its own.
+        #
+        # THIS ALERT EXISTS BECAUSE THE BETTER FIX IS NOT AVAILABLE HERE.
+        # `preRunningDeadlineSeconds` would bound the pre-Running phase and
+        # fail the Job with a clear reason, but this cluster's RayJob CRD
+        # does not have that field. A structural CRD silently drops fields
+        # it does not know, so setting it protects nothing. This alert does
+        # not stop the stuck run — only that field could — but it uses
+        # `kube_pod_status_phase`, already
+        # collected for every pod, and turns 4 hours of silence into a
+        # named alert after 45 minutes.
+        #
+        # WHY 45 MINUTES. The measured pre-Running path is about 19 minutes
+        # (14 for dataset download plus 5 for placement-group formation),
+        # plus time for a cold pull of the large CUDA/PyTorch image. 45
+        # minutes is about 2.4 times that, so a slow but healthy start does
+        # not trigger the alert. Time spent waiting in the Kueue queue does
+        # not count: a queued workload has `suspend: true` and no pods, so
+        # there is nothing Pending to measure.
+        #
+        # DO NOT ADD A POD NAME OR OWNER MATCHER. Under user-workload
+        # monitoring, this rule can only see its own namespace. In that
+        # namespace, any pod Pending for 45 minutes is a problem — a RayJob
+        # worker, the MLflow server, the canary, or a forgotten Job. A name
+        # matcher here means the next workload ships with no alert coverage
+        # at all.
+        #
+        # This overlaps FbdaContainerWaitingOnConfig on purpose. A pod
+        # stuck in CreateContainerConfigError is also Pending, so it
+        # triggers that alert at 15 minutes with the exact cause, and this
+        # alert at 45 minutes as a backstop for every other cause.
+        - alert: FbdaPodPendingTooLong
+          expr: |
+            max by (namespace, pod) (kube_pod_status_phase{phase="Pending"} == 1)
+          for: 45m
+          labels:
+            severity: warning
+            component: fbda-pipeline
+          annotations:
+            summary: "Pod {{ $labels.pod }} has been Pending for 45 minutes"
+            description: >-
+              Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has been Pending for 45
+              minutes. For a RayJob worker this is the gang-never-forms signature: the job holds
+              its Kueue admission and will not be killed until activeDeadlineSeconds expires hours
+              from now, with a message that will not say why. Check `oc describe pod
+              {{ $labels.pod }}` for the scheduling event — unschedulable on GPU nodes, image pull,
+              or a volume that will not attach.
+
+    # =========================================================================================
+    # group 1 — storage
+    # =========================================================================================
+    - name: fbda-pipeline-storage
+      rules:
+        # An overlay patches this expr by array index. Keep it first in this
+        # group.
+        #
+        # THIS RULE USES ABSOLUTE BYTES, NOT A PERCENTAGE. That is the whole
+        # point. The platform's KubePersistentVolumeFillingUp fires below 3%
+        # free. On the 800Gi fbda-shared volume, 3% is 24 GB — far below one
+        # 366 GiB (~393 GB) checkpoint. A percentage threshold on a large volume means
+        # the alert arrives after the write it should have prevented has
+        # already failed. The measured low point was 67.7 GiB free of 800
+        # GiB (91.5% full), with no alert possible.
+        #
+        # THIS RULE IS SCOPED TO ONE PVC ON PURPOSE. An absolute byte
+        # threshold only makes sense for a known volume size. Without a PVC
+        # scope, "under 100 GiB free" would always fire against the 20Gi
+        # mlflow-store PVC in this namespace, which can never have 100 GiB
+        # free. A second large volume needs its own rule, not a wider
+        # matcher.
+        #
+        # THE BASE THRESHOLD (100 GiB) IS A GENERIC, CONSERVATIVE FLOOR, not
+        # a real sizing — this base file does not know how large your
+        # checkpoints are, and this is what ships and renders by default: the
+        # overlay's own 400 GiB patch (below) is shipped commented out. Set
+        # the correct threshold — one checkpoint size plus margin — in your
+        # overlay. See overlays/example/30-pipeline/kustomization.yaml, which
+        # documents (but does not apply, until you uncomment it) a 400 GiB
+        # floor sized for this pipeline's own checkpoint (366 GiB, ~393 GB).
+        # If you leave this at 100 GiB, the alert fires only after the volume
+        # is already too full to hold one such checkpoint.
+        #
+        # Use `for: 10m`: long enough to ignore a brief drop during
+        # checkpoint cleanup, and much shorter than the roughly 2-hour
+        # window during which this metric exists at all (see the next
+        # rule).
+        - alert: FbdaVolumeHeadroomLow
+          expr: |
+            kubelet_volume_stats_available_bytes{persistentvolumeclaim="fbda-shared"} < 100 * 1024 * 1024 * 1024
+          for: 10m
+          labels:
+            severity: warning
+            component: fbda-pipeline
+          annotations:
+            summary: "fbda-shared has less than the configured absolute headroom free"
+            description: >-
+              fbda-shared in namespace {{ $labels.namespace }} has {{ $value | humanize1024 }}B
+              free, below the configured absolute floor. Compare against ONE checkpoint, not
+              against a percentage. NFS reports ENOSPC at close()/fsync(), not at write(), and
+              DeepSpeed's TorchCheckpointEngine.commit() is `return True` — so a checkpoint save
+              onto a full volume can report success and lose the run's output silently.
+
+        # THERE IS NO INODE RULE HERE. This is deliberate — keep reading
+        # before you add one back.
+        #
+        # A rule on `kubelet_volume_stats_inodes_free` looks like it should exist: a ZeRO-3
+        # checkpoint has many files, and running out of inodes looks like ENOSPC with bytes
+        # still free. Such a rule could never fire.
+        #
+        # ON THIS STORAGE CLASS, THE "INODE" COUNTERS ARE 512-BYTE BLOCKS,
+        # NOT FILES:
+        #
+        #   kubelet_volume_stats_inodes         = 1,677,721,600
+        #   kubelet_volume_stats_capacity_bytes =   858,993,459,200
+        #   1,677,721,600 x 512                 =   858,993,459,200   (exact match)
+        #
+        #   kubelet_volume_stats_inodes_used    =     767,868,062
+        #   kubelet_volume_stats_used_bytes     =     393,148,366,848
+        #   767,868,062 x 512                   =     393,148,447,744   (within 0.00002%)
+        #
+        # FlashBlade's NFS reports file counts in 512-byte units, so
+        # `inodes_free` only restates `available_bytes` and gives no real
+        # file-count information. The actual checkpoint has 18 files; the
+        # metric read 767 million.
+        #
+        # Such a rule would also be weaker than the headroom rule above: a 1,000,000-free
+        # threshold equals 512 MB free, which the headroom rule already catches about 400 GiB
+        # earlier. It would fire only after the real alert, for a condition it is not actually
+        # measuring.
+        #
+        # A rule that can never fire looks the same as a healthy system. If
+        # a future storage class reports true file counts, redo the math
+        # above before adding an inode rule back.
+
+        # THIS RULE WATCHES THE RULE ABOVE. If the underlying series
+        # disappears, an expression like `available_bytes < X` returns no
+        # data, so the rule does not fire — and that looks the same as a
+        # healthy volume everywhere in the UI. The storage rule above is
+        # blind in this way. This rule is what watches for it.
+        #
+        # THIS IS NOT A PLAIN `absent()`, AND THAT IS DELIBERATE.
+        # `kubelet_volume_stats_*` only exists while a pod mounts the PVC.
+        # Between training runs, the series is expected to disappear. A
+        # plain `absent()` would fire every night and get muted within a
+        # week. These series do appear for NFS-backed volumes, correctly,
+        # but only while mounted. The real guard is: the series is absent
+        # AND at least one Running pod
+        # has this PVC mounted. That combination is always a genuine
+        # problem — the kubelet is failing to publish stats for a volume
+        # that is mounted right now.
+        #
+        # `for: 30m` has a reason on both ends. It must be longer than the
+        # kubelet's delay in reporting stats after a fresh mount (a large
+        # NFS volume can take several minutes to appear). It must also stay
+        # well under the roughly 2-hour life of a training mount, or the
+        # rule can never complete its `for` window and never fires. For the
+        # same reason, this file has no `predict_linear` over a 6-hour
+        # window: predicting 6 hours ahead from a series that only exists
+        # for 2 hours is not meaningful.
+        - alert: FbdaVolumeStatsAbsentWhileMounted
+          expr: |
+            absent(kubelet_volume_stats_available_bytes{persistentvolumeclaim="fbda-shared"})
+            and on ()
+            (
+              count(
+                kube_pod_spec_volumes_persistentvolumeclaims_info{persistentvolumeclaim="fbda-shared"}
+                * on (namespace, pod) group_left () (kube_pod_status_phase{phase="Running"} == 1)
+              ) > 0
+            )
+          for: 30m
+          labels:
+            severity: warning
+            component: fbda-pipeline
+          annotations:
+            summary: "No kubelet volume stats for fbda-shared while a pod has it mounted"
+            description: >-
+              A Running pod declares the fbda-shared PVC but kubelet has published no
+              kubelet_volume_stats_available_bytes for it for 30 minutes. The headroom alert in
+              this group is evaluating against an empty vector right now and therefore cannot
+              fire. Treat the storage alerts as OFF until this clears.

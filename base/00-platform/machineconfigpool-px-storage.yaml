@@ -1,0 +1,43 @@
+# Phase 00 applies this MachineConfigPool. It selects nodes with the label
+# node-role.kubernetes.io/px-storage. Nothing in the documented sequence sets this
+# label, so on a fresh install this pool has zero members and no node reboots. Read
+# the warning in machineconfig-px-loopback.yaml before you label any node.
+#
+# This custom MachineConfigPool gives the loopback-device MachineConfig only to the
+# non-GPU worker nodes. GPU nodes live in a separate `gpu` MachineConfigPool and never
+# match this pool's nodeSelector.
+#
+# WARNING: label only the real non-GPU worker nodes. Do not label control-plane
+# nodes. Check node roles with `oc get nodes` — do not guess a node's role from its
+# name. Labeling a control-plane node into this pool drains and reboots it, and can
+# stop the Machine Config Operator from working. Portworx internal-KVDB needs a
+# 3-node quorum; if fewer eligible worker nodes exist, that quorum is not possible.
+# See the warning in machineconfig-px-loopback.yaml for the alternatives.
+#
+# Guarded apply order, only if the KVDB-quorum problem above is resolved (for
+# example, by using an external KVDB):
+#   1. Check GPU isolation first: `oc get nodes -l node-role.kubernetes.io/gpu -o name`
+#      must list only the GPU nodes. Never give a GPU node the px-storage label.
+#   2. Create this MachineConfigPool:
+#      `oc create -f base/00-platform/machineconfigpool-px-storage.yaml`
+#   3. For each eligible worker node, confirm it is a plain worker node, then label it:
+#      `oc label node <n> node-role.kubernetes.io/px-storage=""`
+#      This label triggers a reboot (maxUnavailable=1).
+#   4. Create the MachineConfig:
+#      `oc create -f base/00-platform/machineconfig-px-loopback.yaml`
+# Verify: `oc get mcp px-storage` shows UPDATED=True with MACHINECOUNT matching the
+# number of nodes you labeled. The `gpu` pool must stay UPDATED=True and unaffected.
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfigPool
+metadata:
+  name: px-storage
+spec:
+  machineConfigSelector:
+    matchExpressions:
+      - key: machineconfiguration.openshift.io/role
+        operator: In
+        values: ["worker", "px-storage"]
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/px-storage: ""
+  maxUnavailable: 1

@@ -1,0 +1,204 @@
+# NVIDIA DCGM GPU dashboard for the OCP web console.
+#
+# The GPU Operator's dcgm-exporter DaemonSet already runs and is already scraped by
+# the platform Prometheus. The only missing piece for a one-click view is a console
+# dashboard. OCP builds console dashboards from ConfigMaps in the
+# `openshift-config-managed` namespace that carry the label
+# `console.openshift.io/dashboard: "true"`. The data value is a Grafana dashboard
+# JSON that queries the in-cluster platform Prometheus. This setup needs no
+# user-workload monitoring and no Grafana operator.
+#
+# WARNING: each panel below must set `span: 6`. The OCP console is not Grafana: it
+# ignores `gridPos` completely, and a panel with no `span` value renders at full
+# width. Do not remove `span` from a panel. Keep `gridPos` too, so the JSON still
+# lays out correctly if you import it into a real Grafana instance.
+#
+# Apply:  oc apply -f base/00-platform/dcgm-console-dashboard.yaml
+# Verify: oc -n openshift-config-managed get cm nvidia-dcgm-dashboard \
+#           -o jsonpath='{.metadata.labels.console\.openshift\.io/dashboard}'   # -> true
+#         then OCP console > Observe > Dashboards > "NVIDIA GPU (DCGM)".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-dcgm-dashboard
+  namespace: openshift-config-managed
+  labels:
+    console.openshift.io/dashboard: "true"
+data:
+  nvidia-dcgm-dashboard.json: |
+    {
+      "title": "NVIDIA GPU (DCGM)",
+      "editable": false,
+      "schemaVersion": 16,
+      "timezone": "browser",
+      "refresh": "30s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "templating": {
+        "list": []
+      },
+      "annotations": {
+        "list": []
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "graph",
+          "title": "GPU Utilization (%)",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 0
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "percent",
+              "min": 0,
+              "max": 100
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "DCGM_FI_DEV_GPU_UTIL",
+              "legendFormat": "{{Hostname}} gpu{{gpu}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 2,
+          "type": "graph",
+          "title": "GPU Framebuffer Used (MiB)",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "decmbytes",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "DCGM_FI_DEV_FB_USED",
+              "legendFormat": "{{Hostname}} gpu{{gpu}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 3,
+          "type": "graph",
+          "title": "GPU Power Draw (W)",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "watt",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "DCGM_FI_DEV_POWER_USAGE",
+              "legendFormat": "{{Hostname}} gpu{{gpu}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        },
+        {
+          "id": 4,
+          "type": "graph",
+          "title": "GPU Temperature (C)",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 8
+          },
+          "span": 6,
+          "yaxes": [
+            {
+              "format": "celsius",
+              "min": 0
+            },
+            {
+              "format": "short"
+            }
+          ],
+          "targets": [
+            {
+              "expr": "DCGM_FI_DEV_GPU_TEMP",
+              "legendFormat": "{{Hostname}} gpu{{gpu}}"
+            }
+          ],
+          "legend": {
+            "show": true,
+            "alignAsTable": false,
+            "rightSide": false,
+            "values": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "total": false,
+            "sideWidth": null
+          }
+        }
+      ]
+    }

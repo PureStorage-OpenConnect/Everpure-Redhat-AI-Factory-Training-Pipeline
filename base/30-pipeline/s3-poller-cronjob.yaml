@@ -1,0 +1,214 @@
+# S3 poller for the checkpoint-training trigger loop.
+#
+# Purity//FB 4.5.5 has no S3 push notifications (PutBucketNotification returns HTTP 501). So
+# this CronJob polls s3://my-inbox/<prefix> on a schedule, removes duplicates by
+# object etag, and POSTs each new object to the Argo Events webhook EventSource
+# (base/20-events/s3-eventsource-sensor.yaml). This drives the Sensor -> pipeline-run trigger.
+#
+# Dedupe state (key and etag, one pair per line) is stored as an object in the same bucket,
+# under the .poller-state/ prefix. This means the poller needs no extra Kubernetes RBAC and
+# no PVC. It uses the existing flashblade-s3 credentials
+# (S3_ENDPOINT=https://<flashblade-data-vip>, s3-account), which already have read and write
+# access to this bucket.
+#
+# This CronJob ships suspended. `oc apply` always resets suspend to true.
+# An unconfigured bucket makes the scheduled poll fail and alert every 5 minutes.
+# See docs/getting-started.md to un-suspend it. Re-applying this phase suspends it again.
+#   oc -n <ns> patch cronjob s3-poller -p '{"spec":{"suspend":false}}'
+# To force one poll without changing suspend:
+#   oc -n <ns> create job trigger-poll --from=cronjob/s3-poller
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: s3-poller
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: s3-poller
+  labels:
+    app.kubernetes.io/part-of: ckpt-training-pipeline
+spec:
+  schedule: "*/5 * * * *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 1800
+      template:
+        spec:
+          serviceAccountName: s3-poller
+          restartPolicy: Never
+          containers:
+            - name: poller
+              image: docker.io/amazon/aws-cli:2.15.30
+              envFrom:
+                - configMapRef:
+                    name: pipeline-config
+              env:
+                # This value comes from pipeline-config (envFrom above). Do not hard-code it.
+                # A literal value here silently overrides the ConfigMap. It works only while
+                # the two values match by chance, and it stops the trigger silently the
+                # moment they do not.
+                - name: BUCKET
+                  # Use configMapKeyRef here. Do not use "$(S3_VALIDATION_BUCKET)".
+                  # Kubernetes expands $(VAR) only from variables declared earlier in this
+                  # same env: list, never from envFrom. A $(...) reference to an envFrom
+                  # value passes through as a literal string. The poller would then list a
+                  # bucket named "$(S3_VALIDATION_BUCKET)", get NoSuchBucket, swallow the
+                  # error, and report new-objects-fired=0 forever.
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pipeline-config
+                      key: S3_VALIDATION_BUCKET
+                # Same rule as BUCKET above: use configMapKeyRef, never a literal, and never
+                # "$(S3_VALIDATION_PREFIX)". This value, CANARY_PREFIX, and STATE_KEY are
+                # shared with the canary CronJob. The canary writes an object under
+                # CANARY_PREFIX, then reads STATE_KEY to check that this poller saw it and
+                # fired it. A literal value here can drift silently from the canary's copy.
+                # The manifests stay valid, but the canary never passes, and it looks like
+                # "the pipeline is broken" instead of "the two prefixes do not match".
+                - name: PREFIX
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pipeline-config
+                      key: S3_VALIDATION_PREFIX
+                # The poller polls the canary prefix too. It must: the canary tests this
+                # poller, so an object the poller never lists proves nothing. Objects here
+                # reach the same webhook and the same Sensor. The Sensor has no data filter
+                # today, so a canary object starts a real 8-GPU RayJob. This is why the
+                # canary CronJob ships suspended. Read its header before you enable it.
+                - name: CANARY_PREFIX
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pipeline-config
+                      key: S3_CANARY_PREFIX
+                - name: STATE_KEY
+                  valueFrom:
+                    configMapKeyRef:
+                      name: pipeline-config
+                      key: S3_POLLER_STATE_KEY
+                - name: WEBHOOK
+                  value: "http://s3-poll-eventsource-svc.argo-events.svc.cluster.local:12000/s3"
+                - name: S3_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: flashblade-s3
+                      key: S3_ENDPOINT
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: flashblade-s3
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: flashblade-s3
+                      key: AWS_SECRET_ACCESS_KEY
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -uo pipefail
+                  # TLS verification is disabled here. The array this pipeline was tested
+                  # against uses a self-signed certificate. Do not keep this in production —
+                  # supply a CA bundle instead.
+                  AWS="aws --endpoint-url $S3_ENDPOINT --no-verify-ssl"
+
+                  # Bucket reachability must be an exit status, because it cannot be a
+                  # metric — a CronJob pod is gone before the next scrape, so nothing can
+                  # scrape a gauge from it. An unreachable or nonexistent bucket must fail
+                  # this Job loudly rather than report "new-objects-fired=0", which is the
+                  # same line a healthy, idle poll prints. head-bucket below runs before any
+                  # listing so that bucket-not-found is a hard failure, distinct from an
+                  # empty listing.
+                  #
+                  # A bucket_reachable gauge would be the better fix, but there is no
+                  # Pushgateway available. So this script does the one thing a Job can do
+                  # honestly: fail. A non-zero exit makes
+                  # kube_job_status_failed non-zero, and FbdaJobFailed in
+                  # pipeline-alerts-prometheusrule.yaml alerts on that. If a Pushgateway is
+                  # added later, replace this with a real gauge.
+                  #
+                  # head-bucket tells apart "bucket absent" (404), "credentials rejected"
+                  # (403), and "bucket present and empty", which the listing alone cannot
+                  # do. It needs the same s3:ListBucket right the poller already needs for
+                  # list-objects-v2, so it does not add any new privilege.
+                  if ! $AWS s3api head-bucket --bucket "$BUCKET" 2>/tmp/head.err; then
+                    echo "FATAL bucket unreachable: s3://$BUCKET :: $(tr -d '\n' < /tmp/head.err)" >&2
+                    exit 1
+                  fi
+
+                  # Get the prior dedupe state. Allow it to be missing: on the very first
+                  # run, the state object does not exist yet. head-bucket above already
+                  # proved the bucket is reachable, so a missing state object here means
+                  # "first run", not "wrong bucket".
+                  $AWS s3 cp "s3://$BUCKET/$STATE_KEY" /tmp/seen.tsv 2>/dev/null || : > /tmp/seen.tsv
+                  sort -o /tmp/seen.tsv /tmp/seen.tsv
+
+                  # Get the current listing: "Key<TAB>ETag" (the API returns ETag already
+                  # quoted, so it is a valid JSON string). This checks two prefixes: the
+                  # dataset inbox and the canary's. The unquoted expansion below splits the
+                  # two values on purpose. An S3 prefix with a space in it would break this,
+                  # so do not use one.
+                  : > /tmp/now.tsv
+                  for P in $PREFIX $CANARY_PREFIX; do
+                    if ! $AWS s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P" \
+                         --query 'Contents[].[Key,ETag]' --output text > /tmp/raw.txt 2>/tmp/list.err; then
+                      echo "FATAL cannot list s3://$BUCKET/$P :: $(tr -d '\n' < /tmp/list.err)" >&2
+                      exit 1
+                    fi
+                    # `--output text` prints the literal string "None" when the query
+                    # matches nothing, for example an empty prefix. If you keep this line,
+                    # it becomes a key named "None", is treated as a new object, and starts
+                    # a training run for an object that does not exist. Remove it.
+                    grep -vx 'None' /tmp/raw.txt >> /tmp/now.tsv || :
+                  done
+                  sort -o /tmp/now.tsv /tmp/now.tsv
+                  # Do not treat the state object itself as a dataset object.
+                  grep -v -P "^$STATE_KEY\t" /tmp/now.tsv > /tmp/now2.tsv || :; mv -f /tmp/now2.tsv /tmp/now.tsv
+                  # New objects are present now and absent from the prior state.
+                  comm -23 /tmp/now.tsv /tmp/seen.tsv > /tmp/new.tsv || :
+                  COUNT=0
+                  while IFS=$'\t' read -r KEY ETAG; do
+                    [ -z "$KEY" ] && continue
+                    BODY=$(printf '{"bucket":"%s","key":"%s","etag":%s}' "$BUCKET" "$KEY" "$ETAG")
+                    # TLS verification is disabled here. The array this pipeline was tested
+                    # against uses a self-signed certificate. Do not keep this in production —
+                    # supply a CA bundle instead.
+                    #
+                    # Without -f, curl treats any response it receives — including a 404 or 500
+                    # from the webhook — as success (exit 0); it only fails on a connection-level
+                    # error. Capture the HTTP status explicitly and fail loudly on anything
+                    # outside 2xx, so a rejected fire is neither logged as "fired:" nor folded
+                    # into the dedupe state below — otherwise a rejected fire would be persisted
+                    # to the state file, permanently marking the object processed even though no
+                    # run ever started.
+                    HTTP_CODE=$(curl -sk -m 15 -o /tmp/webhook_body.txt -w '%{http_code}' \
+                        -X POST -H 'Content-Type: application/json' -d "$BODY" "$WEBHOOK")
+                    case "$HTTP_CODE" in
+                      2??)
+                        echo "fired: key=$KEY etag=$ETAG"; COUNT=$((COUNT+1))
+                        ;;
+                      *)
+                        echo "FATAL webhook rejected key=$KEY :: HTTP $HTTP_CODE :: $(tr -d '\n' < /tmp/webhook_body.txt 2>/dev/null)" >&2
+                        exit 1
+                        ;;
+                    esac
+                  done < /tmp/new.tsv
+                  echo "new-objects-fired=$COUNT"
+                  # Save the merged state only after all fires succeed. Treat a failed save
+                  # as a job failure. If this write is lost, the next cycle re-fires every
+                  # object it just fired — a duplicate 8-GPU training run for each object,
+                  # with no trace but one ignored line on stdout. The canary also depends on
+                  # this file: it checks that the poller fired an object by looking for the
+                  # key here. A state save that silently fails makes the canary fail while
+                  # the poller reports success.
+                  cat /tmp/seen.tsv /tmp/now.tsv | sort -u > /tmp/merged.tsv
+                  if ! $AWS s3 cp /tmp/merged.tsv "s3://$BUCKET/$STATE_KEY" >/dev/null 2>/tmp/put.err; then
+                    echo "FATAL could not persist dedupe state to s3://$BUCKET/$STATE_KEY :: $(tr -d '\n' < /tmp/put.err) — the next cycle will re-fire these $COUNT object(s)" >&2
+                    exit 1
+                  fi
